@@ -1,0 +1,2290 @@
+<!DOCTYPE html>
+<html lang="ja" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LecturePulse - リアルタイム講義リアクション＆推移分析</title>
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- MQTT.js CDN (サーバー構築不要で別々のスマホ・PC間をリアルタイム同期するWebSocket通信ライブラリ) -->
+  <script src="https://unpkg.com/mqtt@5.3.4/dist/mqtt.min.js"></script>
+  <!-- QRCode生成ライブラリ (スマホカメラで確実に読み取れる本物のQRコードを生成) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&family=Noto+Sans+JP:wght@400;500;700;900&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      color-scheme: dark;
+    }
+    body {
+      font-family: 'Inter', 'Noto Sans JP', sans-serif;
+      background-color: #020617;
+      color: #f8fafc;
+      margin: 0;
+      padding: 0;
+      overflow-x: hidden;
+    }
+    @keyframes floatUpEmoji {
+      0% {
+        transform: translateY(0) scale(0.6) rotate(0deg);
+        opacity: 0;
+      }
+      15% {
+        opacity: 1;
+        transform: translateY(-45px) scale(1.15) rotate(-8deg);
+      }
+      60% {
+        opacity: 0.95;
+        transform: translateY(-210px) scale(1) rotate(8deg);
+      }
+      100% {
+        transform: translateY(-420px) scale(0.75) rotate(-5deg);
+        opacity: 0;
+      }
+    }
+    .floating-emoji {
+      position: absolute;
+      bottom: 20px;
+      pointer-events: none;
+      user-select: none;
+      animation: floatUpEmoji forwards cubic-bezier(0.16, 1, 0.3, 1);
+      filter: drop-shadow(0 6px 12px rgba(0,0,0,0.45));
+      z-index: 50;
+    }
+    @keyframes feverPulse {
+      0%, 100% {
+        box-shadow: 0 0 18px rgba(245, 158, 11, 0.35), inset 0 0 15px rgba(244, 63, 94, 0.2);
+      }
+      50% {
+        box-shadow: 0 0 36px rgba(244, 63, 94, 0.65), inset 0 0 25px rgba(245, 158, 11, 0.35);
+      }
+    }
+    .fever-glow {
+      animation: feverPulse 1.8s infinite ease-in-out;
+    }
+    /* カスタムスクロールバー */
+    ::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    ::-webkit-scrollbar-track {
+      background: #0f172a;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: #334155;
+      border-radius: 9999px;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background: #475569;
+    }
+  </style>
+</head>
+<body class="min-h-screen bg-slate-950 text-slate-100 flex flex-col selection:bg-indigo-500 selection:text-white">
+
+  <!-- 浮かび上がる絵文字レイヤー -->
+  <div id="floating-layer" class="fixed inset-0 pointer-events-none z-40 overflow-hidden"></div>
+
+  <!-- トースト通知レイヤー -->
+  <div id="toast-container" class="fixed bottom-5 right-5 z-50 flex flex-col gap-2 pointer-events-none"></div>
+
+  <!-- プレビュー確認用：受講生専用ロック状態の解除バナー（講師がロック状態をテストした際に戻れるようにする安全装置） -->
+  <div id="student-lock-banner" class="hidden bg-gradient-to-r from-sky-950 via-indigo-950 to-slate-900 border-b border-sky-500/40 px-4 py-2 text-xs text-sky-200 items-center justify-between gap-2 z-30">
+    <div class="flex items-center gap-2">
+      <span class="px-2 py-0.5 rounded bg-sky-500/20 border border-sky-400/40 text-sky-300 font-bold">🔒 受講生専用ロックモード表示中</span>
+      <span>QRコードからアクセスした受講生の画面です（講師画面タブやデモ操作は一切表示されません）。</span>
+    </div>
+    <button id="btn-exit-student-lock" type="button" class="px-3 py-1 rounded-lg bg-sky-500 hover:bg-sky-400 text-slate-950 font-bold transition shrink-0 cursor-pointer">
+      ロックを解除して講師画面へ戻る
+    </button>
+  </div>
+
+  <!-- ==========================================
+       ヘッダー＆ナビゲーションバー
+  ========================================== -->
+  <header class="sticky top-0 z-30 backdrop-blur-md bg-slate-900/85 border-b border-slate-800 px-4 py-3">
+    <div class="max-w-7xl mx-auto flex flex-col lg:flex-row items-center justify-between gap-3">
+      
+      <!-- ロゴ＆タイトル -->
+      <div class="flex items-center justify-between w-full lg:w-auto gap-3">
+        <div class="flex items-center gap-2.5">
+          <div id="brand-icon-box" class="w-10 h-10 rounded-xl flex items-center justify-center font-black text-xl shadow-lg bg-gradient-to-tr from-indigo-600 to-emerald-500 text-white select-none">
+            ⚡
+          </div>
+          <div>
+            <div class="flex items-center gap-2 flex-wrap">
+              <h1 class="font-extrabold text-lg tracking-tight text-white">LecturePulse</h1>
+              <!-- クラウドリアルタイム同期ステータスバッジ -->
+              <button id="cloud-status-badge" type="button" class="inline-flex items-center gap-1.5 px-2.5 py-0.5 text-[11px] font-bold rounded-full bg-amber-500/20 border border-amber-500/40 text-amber-300 transition cursor-pointer" title="クリックしてクラウド通信を再接続">
+                <span id="cloud-status-dot" class="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
+                <span id="cloud-status-text">クラウド接続中...</span>
+              </button>
+              <span id="fever-badge" class="hidden px-2 py-0.5 text-[11px] font-black rounded-full bg-gradient-to-r from-amber-400 to-rose-500 text-slate-950 animate-bounce">
+                🔥 FEVER!!
+              </span>
+              <span id="student-only-pill" class="hidden px-2 py-0.5 text-[11px] font-bold rounded-full bg-emerald-500/20 border border-emerald-500/40 text-emerald-300">
+                📱 受講生モード
+              </span>
+            </div>
+            <p class="text-xs text-slate-400">大学講義リアルタイム・リアクション＆推移集計</p>
+          </div>
+        </div>
+
+        <!-- モバイル用ステータス -->
+        <div class="flex lg:hidden items-center gap-1.5 text-xs bg-slate-800/90 px-2.5 py-1 rounded-full border border-slate-700">
+          <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+          <span>参加: <strong id="mobile-participants" class="font-mono text-white">1</strong>人</span>
+        </div>
+      </div>
+
+      <!-- モード切替タブ（受講生ロック時は完全非表示） -->
+      <div id="mode-switcher-group" class="flex bg-slate-950 p-1 rounded-xl border border-slate-800 w-full sm:w-auto">
+        <button id="tab-btn-student" type="button" class="flex-1 sm:flex-initial flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-xs sm:text-sm font-bold transition-all bg-indigo-600 text-white shadow-md shadow-indigo-600/30 cursor-pointer">
+          <span>📱 受講生画面 (スマホ用)</span>
+        </button>
+        <button id="tab-btn-instructor" type="button" class="flex-1 sm:flex-initial flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-xs sm:text-sm font-bold transition-all text-slate-400 hover:text-slate-200 cursor-pointer">
+          <span>📊 講師・スクリーン画面</span>
+          <span id="instructor-lock-indicator" class="text-[11px] bg-slate-800 text-amber-300 px-1.5 py-0.5 rounded border border-slate-700">🔒PIN</span>
+        </button>
+      </div>
+
+      <!-- ルームID ＆ QRコード共有ボタン -->
+      <div class="flex flex-wrap items-center justify-end gap-2 w-full lg:w-auto">
+        <!-- 講義ルームコード -->
+        <form id="form-room" class="flex items-center bg-slate-950 rounded-xl border border-slate-800 px-2.5 py-1.5">
+          <span class="text-xs text-slate-400 mr-1.5 font-medium">講義コード:</span>
+          <input id="input-room" type="text" value="LECTURE-101" class="bg-transparent text-xs font-mono font-bold text-emerald-400 w-28 focus:outline-none uppercase" placeholder="LECTURE-101" />
+          <button id="btn-copy-room" type="button" class="ml-1 px-1.5 py-0.5 text-[11px] bg-slate-800 hover:bg-slate-700 text-slate-300 rounded transition cursor-pointer" title="講義コードをコピー">
+            コピー
+          </button>
+        </form>
+
+        <!-- QRコード共有ボタン（受講生ロック時は非表示） -->
+        <button id="btn-open-qr" type="button" class="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 text-white text-xs font-bold shadow-md shadow-indigo-600/25 transition cursor-pointer">
+          <span>🔗 受講生に共有 (QR)</span>
+        </button>
+      </div>
+
+    </div>
+  </header>
+
+  <!-- ==========================================
+       共通：講義ヒートアップゲージ（ボルテージメーター）
+  ========================================== -->
+  <section class="bg-slate-900/60 border-b border-slate-800/80 px-4 py-2.5">
+    <div class="max-w-7xl mx-auto flex flex-col sm:flex-row items-center gap-3">
+      <div class="flex items-center gap-2 text-xs font-bold shrink-0">
+        <span id="heat-icon" class="text-base">🔥</span>
+        <span class="text-slate-300">講義ヒートアップゲージ:</span>
+        <span id="heat-percent-text" class="font-mono text-sm text-amber-400 font-extrabold">0%</span>
+      </div>
+
+      <div class="w-full bg-slate-950 h-3.5 rounded-full overflow-hidden border border-slate-800 p-0.5 relative">
+        <div id="heat-bar-fill" class="h-full rounded-full transition-all duration-500 bg-gradient-to-r from-emerald-500 via-amber-500 to-orange-500" style="width: 4%;"></div>
+      </div>
+
+      <div class="hidden md:flex items-center gap-4 text-xs text-slate-400 shrink-0">
+        <div>ペース: <strong id="header-rpm" class="text-white font-mono">0</strong> 回/分</div>
+        <div>総リアクション: <strong id="header-total" class="text-emerald-400 font-mono">0</strong> 件</div>
+        <div>参加人数: <strong id="header-participants" class="text-indigo-400 font-mono">1</strong> 名</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==========================================
+       メインコンテンツ領域
+  ========================================== -->
+  <main class="max-w-7xl w-full mx-auto p-4 sm:p-6 flex-1">
+
+    <!-- ==========================================
+         1. 受講生画面 (スマホ操作・リアクション送信)
+         ※デモモード切替ボタンは一切表示しない
+    ========================================== -->
+    <div id="view-student" class="max-w-md mx-auto space-y-5">
+      
+      <!-- 貢献スコア＆コンボカード -->
+      <div id="student-score-card" class="rounded-2xl p-5 border bg-slate-900/90 border-slate-800 shadow-xl transition-all">
+        <div class="flex items-center justify-between mb-4">
+          <div>
+            <span class="text-xs text-slate-400 block">あなたの講義貢献スコア</span>
+            <div class="flex items-baseline gap-1.5 mt-0.5">
+              <span class="text-xl">🏆</span>
+              <span id="student-score" class="text-3xl font-black font-mono tracking-tight text-white">0</span>
+              <span class="text-xs text-slate-400 font-bold">PTS</span>
+            </div>
+          </div>
+
+          <!-- コンボ表示 -->
+          <div class="text-right">
+            <div id="student-combo-box" class="inline-flex flex-col items-end px-3.5 py-1.5 rounded-xl border bg-slate-950 border-slate-800 text-slate-400 transition-all duration-200">
+              <span class="text-[10px] font-bold uppercase tracking-wider">COMBO</span>
+              <div class="text-2xl font-black font-mono leading-none">
+                <span id="student-combo">0</span> <span class="text-xs">連打!</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- スパム防止用エネルギーゲージ (1秒3回まで) -->
+        <div class="space-y-1.5">
+          <div class="flex justify-between items-center text-xs">
+            <span class="text-slate-400 flex items-center gap-1">
+              <span>⚡ タップエネルギー（1秒間に3回まで）</span>
+            </span>
+            <span id="cooldown-warning" class="hidden text-rose-400 font-bold animate-pulse">
+              ⚡ 少しゆっくりタップしてね！
+            </span>
+          </div>
+          <div class="grid grid-cols-3 gap-1.5">
+            <div id="energy-bar-0" class="h-2 rounded-full bg-emerald-400 shadow-sm shadow-emerald-500/50 transition-all duration-200"></div>
+            <div id="energy-bar-1" class="h-2 rounded-full bg-emerald-400 shadow-sm shadow-emerald-500/50 transition-all duration-200"></div>
+            <div id="energy-bar-2" class="h-2 rounded-full bg-emerald-400 shadow-sm shadow-emerald-500/50 transition-all duration-200"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- リアクションボタン・グリッド (動的生成) -->
+      <div id="student-reaction-grid" class="grid grid-cols-2 gap-3.5"></div>
+
+      <!-- 教室全体の理解度・空気感ミニメーター -->
+      <div class="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 space-y-3">
+        <div class="flex items-center justify-between text-xs font-bold text-slate-300">
+          <span>現在の教室の空気感（理解度バランス）</span>
+          <span id="student-positive-ratio-text" class="text-emerald-400">50% ポジティブ</span>
+        </div>
+        <div class="w-full h-3 bg-slate-950 rounded-full overflow-hidden flex border border-slate-800">
+          <div id="student-pos-bar" class="bg-gradient-to-r from-emerald-500 to-amber-400 h-full transition-all duration-500" style="width: 50%;"></div>
+          <div id="student-neg-bar" class="bg-gradient-to-r from-indigo-500 to-rose-500 h-full transition-all duration-500" style="width: 50%;"></div>
+        </div>
+        <div class="flex justify-between text-[11px] text-slate-400">
+          <span>ポジティブ反応 (<strong id="student-pos-count" class="text-slate-200">0</strong>)</span>
+          <span>フォロー推奨反応 (<strong id="student-neg-count" class="text-slate-200">0</strong>)</span>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- ==========================================
+         2. 講師・スクリーン画面 (リアルタイム集計・グラフ・設定)
+    ========================================== -->
+    <div id="view-instructor" class="hidden space-y-6">
+
+      <!-- 講師用コントロールパネル（デモモード・リアクション編集・90分サンプル生成・PIN設定） -->
+      <div class="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 sm:p-5 flex flex-col xl:flex-row items-start xl:items-center justify-between gap-4 shadow-lg">
+        <div>
+          <div class="flex items-center gap-2">
+            <span class="px-2 py-0.5 rounded bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 text-xs font-bold">講師専用コントロール</span>
+            <h2 class="text-sm sm:text-base font-extrabold text-white">リアクション設定・デモ操作・サンプル推移生成</h2>
+          </div>
+          <p class="text-xs text-slate-400 mt-1">
+            ここでリアクション種類を変更すると受講生画面にも即時反映されます。デモ連打機能は講師画面でのみ操作可能です。
+          </p>
+        </div>
+
+        <div class="flex flex-wrap items-center gap-2 w-full xl:w-auto">
+          <!-- 講師専用：1人テスト用AI学生シミュレーター -->
+          <div class="flex items-center gap-1.5 bg-slate-950 p-1.5 rounded-xl border border-slate-800">
+            <button id="btn-sim-toggle" type="button" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all bg-slate-800 text-slate-200 hover:bg-slate-700 cursor-pointer">
+              <span id="sim-btn-icon">▶️</span>
+              <span id="sim-btn-text">1人テスト用デモ (OFF)</span>
+            </button>
+            <select id="select-sim-speed" class="bg-slate-900 text-amber-300 text-xs font-bold px-2 py-1.5 rounded-lg border border-slate-700 focus:outline-none cursor-pointer">
+              <option value="low">少なめ</option>
+              <option value="normal" selected>通常ペース</option>
+              <option value="fever">FEVER連打</option>
+            </select>
+          </div>
+
+          <!-- 90分講義のサンプルデータ一括生成ボタン -->
+          <button id="btn-generate-90m" type="button" class="flex items-center justify-center gap-1.5 px-3.5 py-2.5 rounded-xl bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/40 text-xs font-bold transition cursor-pointer">
+            <span>✨ 90分講義のサンプル推移データを生成</span>
+          </button>
+
+          <!-- リアクション種類を変更・編集ボタン -->
+          <button id="btn-open-customizer" type="button" class="flex items-center justify-center gap-1.5 px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold shadow-lg shadow-indigo-600/30 transition cursor-pointer">
+            <span>⚙️ リアクション種類を変更・編集</span>
+          </button>
+
+          <!-- 講師PINロック設定ボタン -->
+          <button id="btn-open-pin-modal" type="button" class="flex items-center justify-center gap-1.5 px-3 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs font-bold transition cursor-pointer">
+            <span id="btn-pin-config-label">🔐 PIN設定 (1234)</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- リアクション種類別 累計カード一覧 (動的生成) -->
+      <div id="instructor-summary-cards" class="grid grid-cols-2 lg:grid-cols-4 gap-4"></div>
+
+      <!-- 単位時間のリアクション数・リアルタイム推移グラフ -->
+      <div class="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 sm:p-6 shadow-xl space-y-5">
+        <div class="flex flex-col xl:flex-row xl:items-center justify-between gap-4">
+          <div>
+            <h3 class="text-base sm:text-lg font-extrabold text-white flex items-center gap-2">
+              <span>📈 単位時間あたりのリアクション数・推移グラフ</span>
+            </h3>
+            <p class="text-xs text-slate-400 mt-0.5">
+              大学の講義時間に合わせて「30分」「1時間」「1時間半(90分)」またはリアルタイム確認用の「1分 / 5分 / 10秒」で集計単位を切り替えられます
+            </p>
+          </div>
+
+          <!-- グラフ集計コントロール群 -->
+          <div class="flex flex-wrap items-center gap-2.5">
+            
+            <!-- 1) 時間集計単位（バケットサイズ） -->
+            <div class="flex flex-wrap items-center bg-slate-950 p-1 rounded-xl border border-slate-800 gap-1">
+              <span class="text-xs text-slate-400 px-2 py-1 font-bold">🕒 時間集計:</span>
+              <button type="button" data-bucket="1800" class="bucket-btn px-2.5 py-1 rounded-lg text-xs font-bold transition bg-indigo-600 text-white cursor-pointer">30分</button>
+              <button type="button" data-bucket="3600" class="bucket-btn px-2.5 py-1 rounded-lg text-xs font-bold transition text-slate-400 hover:text-white cursor-pointer">1時間</button>
+              <button type="button" data-bucket="5400" class="bucket-btn px-2.5 py-1 rounded-lg text-xs font-bold transition text-slate-400 hover:text-white cursor-pointer">1時間半</button>
+              <span class="text-slate-700 px-0.5">|</span>
+              <button type="button" data-bucket="300" class="bucket-btn px-2 py-1 rounded-lg text-xs font-bold transition text-slate-400 hover:text-white cursor-pointer">5分</button>
+              <button type="button" data-bucket="60" class="bucket-btn px-2 py-1 rounded-lg text-xs font-bold transition text-slate-400 hover:text-white cursor-pointer">1分</button>
+              <button type="button" data-bucket="10" class="bucket-btn px-2 py-1 rounded-lg text-xs font-bold transition text-slate-400 hover:text-white cursor-pointer">10秒</button>
+            </div>
+
+            <!-- 2) 全体表示枠（タイムウィンドウ） -->
+            <div class="flex flex-wrap items-center bg-slate-950 p-1 rounded-xl border border-slate-800 gap-1">
+              <span class="text-xs text-slate-400 px-2 py-1 font-bold">全体枠:</span>
+              <button type="button" data-window="30" class="window-btn px-2.5 py-1 rounded-lg text-xs font-bold transition text-slate-400 hover:text-white cursor-pointer">30分</button>
+              <button type="button" data-window="60" class="window-btn px-2.5 py-1 rounded-lg text-xs font-bold transition text-slate-400 hover:text-white cursor-pointer">1時間</button>
+              <button type="button" data-window="90" class="window-btn px-2.5 py-1 rounded-lg text-xs font-bold transition bg-amber-500 text-slate-950 cursor-pointer">1時間半(90分)</button>
+              <button type="button" data-window="180" class="window-btn px-2.5 py-1 rounded-lg text-xs font-bold transition text-slate-400 hover:text-white cursor-pointer">3時間</button>
+              <button type="button" data-window="5" class="window-btn px-2 py-1 rounded-lg text-xs font-bold transition text-slate-400 hover:text-white cursor-pointer">直近5分</button>
+            </div>
+
+            <!-- 3) グラフ種類切替 -->
+            <div class="flex items-center bg-slate-950 p-1 rounded-xl border border-slate-800 gap-1">
+              <button id="chart-type-bar" type="button" class="px-2.5 py-1 rounded-lg text-xs font-bold transition bg-emerald-600 text-white cursor-pointer">積み上げ棒</button>
+              <button id="chart-type-line" type="button" class="px-2.5 py-1 rounded-lg text-xs font-bold transition text-slate-400 hover:text-white cursor-pointer">折れ線(面)</button>
+            </div>
+
+          </div>
+        </div>
+
+        <!-- グラフ凡例（動的生成） -->
+        <div id="chart-legend" class="flex flex-wrap items-center gap-4 pt-1 text-xs"></div>
+
+        <!-- カスタムHTML5 Canvas グラフ描画コンテナ -->
+        <div class="relative w-full h-80 sm:h-96 bg-slate-950/80 rounded-xl border border-slate-800/90 p-3">
+          <canvas id="reaction-chart-canvas" class="w-full h-full block"></canvas>
+          <div id="chart-tooltip" class="hidden absolute pointer-events-none z-20 bg-slate-900/95 border border-slate-700 rounded-xl p-3 shadow-2xl text-xs min-w-[160px]"></div>
+        </div>
+
+        <!-- 時間帯別 集計テーブル（30分 / 1時間 / 1時間半の数値内訳も一目でわかるテーブル） -->
+        <div class="pt-2">
+          <div class="flex items-center justify-between mb-2">
+            <span class="text-xs font-bold text-slate-300">📊 時間帯ごとの集計内訳テーブル</span>
+            <span id="table-interval-badge" class="text-[11px] text-indigo-300 font-mono">集計単位: 30分ごと</span>
+          </div>
+          <div class="overflow-x-auto rounded-xl border border-slate-800 bg-slate-950/60">
+            <table class="w-full text-left border-collapse text-xs">
+              <thead id="breakdown-thead" class="bg-slate-900/90 text-slate-400 border-b border-slate-800"></thead>
+              <tbody id="breakdown-tbody" class="divide-y divide-slate-800/60 font-mono"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- 下段：理解度インサイト ＆ データ出力・管理 -->
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        
+        <!-- 講義インサイト -->
+        <div class="lg:col-span-2 bg-slate-900/90 border border-slate-800 rounded-2xl p-5 flex flex-col justify-between">
+          <div>
+            <h3 class="text-sm font-bold text-slate-200 flex items-center gap-2">
+              <span>💡 リアルタイム講義インサイト（理解度＆盛り上がり分析）</span>
+            </h3>
+            <div class="mt-4 space-y-2">
+              <div class="flex justify-between text-xs font-bold">
+                <span id="ins-pos-label" class="text-emerald-400">ポジティブ反応: 50% (0件)</span>
+                <span id="ins-neg-label" class="text-indigo-400">フォロー推奨反応: 50% (0件)</span>
+              </div>
+              <div class="w-full h-4 bg-slate-950 rounded-full overflow-hidden flex border border-slate-800">
+                <div id="ins-pos-bar" class="bg-gradient-to-r from-emerald-500 to-amber-400 h-full transition-all duration-500" style="width: 50%;"></div>
+                <div id="ins-neg-bar" class="bg-gradient-to-r from-indigo-500 to-rose-500 h-full transition-all duration-500" style="width: 50%;"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-3 gap-3 mt-5 pt-4 border-t border-slate-800/80 text-center">
+            <div class="bg-slate-950/70 rounded-xl p-2.5 border border-slate-800">
+              <span class="text-[11px] text-slate-400 block">累計リアクション総数</span>
+              <span id="ins-total-count" class="text-xl font-black font-mono text-white">0</span>
+            </div>
+            <div class="bg-slate-950/70 rounded-xl p-2.5 border border-slate-800">
+              <span class="text-[11px] text-slate-400 block">直近1分のペース</span>
+              <span class="text-xl font-black font-mono text-emerald-400"><span id="ins-rpm">0</span> <span class="text-xs font-normal">/分</span></span>
+            </div>
+            <div class="bg-slate-950/70 rounded-xl p-2.5 border border-slate-800">
+              <span class="text-[11px] text-slate-400 block">最大ピーク時間帯</span>
+              <span id="ins-peak-time" class="text-xs font-bold font-mono text-amber-400 block mt-1.5">---</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- CSV出力 ＆ リセット -->
+        <div class="bg-slate-900/90 border border-slate-800 rounded-2xl p-5 flex flex-col justify-between space-y-4">
+          <div>
+            <h3 class="text-sm font-bold text-slate-200">講義データ管理・CSVエクスポート</h3>
+            <p class="text-xs text-slate-400 mt-1">
+              現在選択している時間単位（30分 / 1時間 / 1時間半など）の集計表をExcel対応のCSVファイルとして保存できます。
+            </p>
+          </div>
+
+          <div class="space-y-2.5">
+            <button id="btn-export-csv" type="button" class="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs shadow-lg shadow-emerald-600/20 transition cursor-pointer">
+              <span>📥 時系列集計データをCSVダウンロード</span>
+            </button>
+            <button id="btn-open-reset" type="button" class="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-rose-950/70 hover:text-rose-300 text-slate-300 border border-slate-700 font-bold text-xs transition cursor-pointer">
+              <span>🗑️ この講義ルームの記録をリセット</span>
+            </button>
+          </div>
+        </div>
+
+      </div>
+
+    </div>
+
+  </main>
+
+  <!-- ==========================================
+       モーダル1：受講生へのQRコード共有 ＆ 受講生ロック確認
+  ========================================== -->
+  <div id="modal-qr" class="hidden fixed inset-0 z-50 items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+    <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-6 shadow-2xl space-y-5 text-center">
+      <div class="flex items-center justify-between border-b border-slate-800 pb-3">
+        <h3 class="text-base font-extrabold text-white">📱 受講生への共有（受講生専用ロック付き）</h3>
+        <button id="btn-close-qr" type="button" class="px-2.5 py-1 rounded-lg bg-slate-800 text-slate-400 hover:text-white text-xs font-bold cursor-pointer">✕ 閉じる</button>
+      </div>
+
+      <p class="text-xs text-slate-300 leading-relaxed">
+        以下のQRコードまたはURLからアクセスした学生は、自動的に<strong class="text-emerald-400">「受講生専用画面（?role=student）」</strong>に固定され、講師用画面やデモ機能を見ることはできません。
+      </p>
+
+      <!-- 動的生成SVG QRコード描画ボックス -->
+      <div class="bg-white p-4 rounded-2xl inline-block mx-auto shadow-inner">
+        <div id="qr-svg-container" class="w-48 h-48 flex items-center justify-center"></div>
+      </div>
+
+      <div class="bg-slate-950 border border-slate-800 rounded-xl p-3 space-y-2 text-left">
+        <div class="flex items-center justify-between text-xs">
+          <span class="text-slate-400">講義コード:</span>
+          <span id="qr-room-label" class="font-mono font-black text-base text-emerald-400">LECTURE-101</span>
+        </div>
+        <div class="flex items-center gap-1.5">
+          <input id="qr-url-input" type="text" readonly class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-[11px] font-mono text-slate-300 focus:outline-none" />
+          <button id="btn-copy-qr-url" type="button" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold rounded-lg shrink-0 transition cursor-pointer">
+            URLコピー
+          </button>
+        </div>
+      </div>
+
+      <!-- プレビュー環境でQR読取時の受講生ロック状態を確認するボタン -->
+      <div class="pt-2 border-t border-slate-800">
+        <button id="btn-simulate-qr-student" type="button" class="w-full py-2.5 px-4 rounded-xl bg-sky-500/20 hover:bg-sky-500/30 border border-sky-400/40 text-sky-300 font-bold text-xs transition cursor-pointer">
+          🔍 QR読取時の「受講生専用ロック画面」を今すぐ確認する
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==========================================
+       モーダル2：講師用リアクション種類カスタマイズ
+  ========================================== -->
+  <div id="modal-customizer" class="hidden fixed inset-0 z-50 items-center justify-center bg-black/80 backdrop-blur-sm p-4 overflow-y-auto">
+    <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-3xl w-full p-5 sm:p-6 shadow-2xl space-y-5 my-8 max-h-[90vh] flex flex-col">
+      <div class="flex items-center justify-between border-b border-slate-800 pb-4 shrink-0">
+        <div>
+          <h3 class="text-lg font-extrabold text-white">⚙️ リアクション種類の変更・カスタマイズ</h3>
+          <p class="text-xs text-slate-400 mt-0.5">絵文字・ボタン名・カラー・分類を自由に変更できます（最大8個まで追加可能）</p>
+        </div>
+        <button id="btn-close-customizer" type="button" class="px-3 py-1.5 rounded-lg bg-slate-800 text-slate-300 hover:text-white text-xs font-bold cursor-pointer">✕ 閉じる</button>
+      </div>
+
+      <!-- スクロール領域 -->
+      <div class="overflow-y-auto space-y-5 pr-1 flex-1">
+        <!-- プリセット選択 -->
+        <div class="space-y-2">
+          <span class="text-xs font-bold text-slate-300 block">ワンクリック・プリセット:</span>
+          <div id="preset-buttons-container" class="grid grid-cols-1 sm:grid-cols-3 gap-2.5"></div>
+        </div>
+
+        <!-- 個別編集リスト -->
+        <div class="space-y-3">
+          <div class="flex items-center justify-between">
+            <span id="customizer-count-label" class="text-xs font-bold text-slate-300">リアクションボタン一覧 (4 / 8)</span>
+            <button id="btn-add-reaction-row" type="button" class="px-3 py-1.5 rounded-lg bg-indigo-600/25 hover:bg-indigo-600/40 text-indigo-300 border border-indigo-500/40 text-xs font-bold transition cursor-pointer">
+              ＋ 新しいボタンを追加
+            </button>
+          </div>
+          <div id="customizer-rows-container" class="space-y-2.5"></div>
+        </div>
+      </div>
+
+      <!-- フッター -->
+      <div class="flex items-center justify-between pt-4 border-t border-slate-800 shrink-0">
+        <button id="btn-reset-default-reactions" type="button" class="text-xs font-bold text-slate-400 hover:text-white transition cursor-pointer">
+          ↺ デフォルトに戻す
+        </button>
+        <div class="flex items-center gap-2.5">
+          <button id="btn-cancel-customizer" type="button" class="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold transition cursor-pointer">
+            キャンセル
+          </button>
+          <button id="btn-save-customizer" type="button" class="px-5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold shadow-lg shadow-indigo-600/30 transition cursor-pointer">
+            設定を保存して反映する
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==========================================
+       モーダル3：講師画面 PIN認証ダイアログ
+  ========================================== -->
+  <div id="modal-pin-auth" class="hidden fixed inset-0 z-50 items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+    <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-sm w-full p-6 shadow-2xl space-y-4">
+      <div class="flex items-center justify-between">
+        <h3 class="text-base font-extrabold text-white">🔒 講師・スクリーン画面のロック解除</h3>
+        <button id="btn-close-pin-auth" type="button" class="text-slate-400 hover:text-white text-xs font-bold cursor-pointer">✕</button>
+      </div>
+      <p class="text-xs text-slate-300 leading-relaxed">
+        受講生が誤って講師画面を開くのを防ぐため、講師用PINコードを入力してください。<br/>
+        <span class="text-emerald-400 font-bold">（初期PINコード: <code class="font-mono bg-slate-950 px-1.5 py-0.5 rounded">1234</code>）</span>
+      </p>
+      <form id="form-pin-auth" class="space-y-3">
+        <input id="input-pin-auth" type="password" inputmode="numeric" placeholder="PINを入力 (初期値: 1234)" class="w-full px-4 py-2.5 rounded-xl bg-slate-950 border border-slate-700 text-center font-mono text-lg font-bold text-white tracking-widest focus:outline-none focus:border-indigo-500" />
+        <p id="pin-auth-error" class="hidden text-xs text-rose-400 font-bold text-center">PINコードが一致しません（初期値は 1234 です）</p>
+        <div class="flex gap-2 pt-1">
+          <button id="btn-Quick-fill-pin" type="button" class="flex-1 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold transition cursor-pointer">
+            1234 を自動入力
+          </button>
+          <button type="submit" class="flex-1 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold shadow-lg shadow-emerald-600/30 transition cursor-pointer">
+            講師画面を開く
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ==========================================
+       モーダル4：講師PIN設定変更ダイアログ
+  ========================================== -->
+  <div id="modal-pin-config" class="hidden fixed inset-0 z-50 items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+    <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-sm w-full p-6 shadow-2xl space-y-4">
+      <div class="flex items-center justify-between border-b border-slate-800 pb-3">
+        <h3 class="text-base font-extrabold text-white">🔐 講師画面PINロック設定</h3>
+        <button id="btn-close-pin-config" type="button" class="text-slate-400 hover:text-white text-xs font-bold cursor-pointer">✕</button>
+      </div>
+      <div class="space-y-3 text-xs">
+        <label class="flex items-center justify-between p-3 rounded-xl bg-slate-950 border border-slate-800 cursor-pointer">
+          <span class="font-bold text-slate-200">講師タブ切替時にPIN入力を求める</span>
+          <input id="checkbox-pin-enabled" type="checkbox" checked class="w-4 h-4 accent-indigo-500" />
+        </label>
+        <div>
+          <span class="text-slate-400 block mb-1">講師用PINコード:</span>
+          <input id="input-new-pin" type="text" value="1234" maxlength="12" class="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-700 font-mono font-bold text-white focus:outline-none focus:border-indigo-500" />
+        </div>
+      </div>
+      <div class="flex justify-end gap-2 pt-2">
+        <button id="btn-save-pin-config" type="button" class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold transition cursor-pointer">
+          保存する
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==========================================
+       モーダル5：データリセット確認
+  ========================================== -->
+  <div id="modal-reset" class="hidden fixed inset-0 z-50 items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+    <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-6 shadow-2xl space-y-4">
+      <h3 class="text-base font-extrabold text-rose-400">⚠️ 講義データのリセット確認</h3>
+      <p class="text-xs text-slate-300 leading-relaxed">
+        現在の講義ルーム（<strong id="reset-room-name" class="font-mono text-emerald-400">LECTURE-101</strong>）に記録されているすべてのリアクション履歴を消去します。よろしいですか？
+      </p>
+      <div class="flex justify-end gap-2.5 pt-2">
+        <button id="btn-cancel-reset" type="button" class="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold transition cursor-pointer">
+          キャンセル
+        </button>
+        <button id="btn-confirm-reset" type="button" class="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold shadow-lg shadow-rose-600/30 transition cursor-pointer">
+          リセットを実行する
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==========================================
+       メインスクリプト（サンドボックス完全保護・単一ファイル完結）
+  ========================================== -->
+  <script>
+    (function () {
+      'use strict';
+
+      // --------------------------------------------------
+      // 1. サンドボックス環境向け 安全なストレージ＆通信ヘルパー
+      // --------------------------------------------------
+      const memoryStore = {};
+      const SafeStorage = {
+        getItem(key) {
+          try {
+            if (typeof window !== 'undefined' && window.localStorage) {
+              const val = window.localStorage.getItem(key);
+              if (val !== null) return val;
+            }
+          } catch (e) {
+            // iframe sandbox SecurityError fallback
+          }
+          return Object.prototype.hasOwnProperty.call(memoryStore, key) ? memoryStore[key] : null;
+        },
+        setItem(key, val) {
+          memoryStore[key] = String(val);
+          try {
+            if (typeof window !== 'undefined' && window.localStorage) {
+              window.localStorage.setItem(key, String(val));
+            }
+          } catch (e) {
+            // ignore in sandboxed iframe
+          }
+        }
+      };
+
+      let safeChannel = null;
+      try {
+        if (typeof BroadcastChannel !== 'undefined') {
+          safeChannel = new BroadcastChannel('lecture_pulse_sync_v2');
+        }
+      } catch (e) {
+        safeChannel = null;
+      }
+
+      function copyTextSafely(text, successMsg) {
+        try {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(() => {
+              showToast(successMsg || 'コピーしました！', 'emerald');
+            }).catch(() => fallbackExecCopy(text, successMsg));
+            return;
+          }
+        } catch (e) {}
+        fallbackExecCopy(text, successMsg);
+      }
+
+      function fallbackExecCopy(text, successMsg) {
+        try {
+          const ta = document.createElement('textarea');
+          ta.value = text;
+          ta.style.position = 'fixed';
+          ta.style.left = '-9999px';
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand('copy');
+          document.body.removeChild(ta);
+          showToast(successMsg || 'コピーしました！', 'emerald');
+        } catch (e) {
+          showToast('テキストを選択してコピーしてください', 'amber');
+        }
+      }
+
+      function showToast(message, colorKey) {
+        const container = document.getElementById('toast-container');
+        if (!container) return;
+        const el = document.createElement('div');
+        const bgClass = colorKey === 'rose'
+          ? 'bg-rose-950/95 border-rose-500/50 text-rose-200'
+          : colorKey === 'amber'
+          ? 'bg-amber-950/95 border-amber-500/50 text-amber-200'
+          : 'bg-slate-900/95 border-emerald-500/50 text-emerald-300';
+        el.className = `px-4 py-2.5 rounded-xl border shadow-xl text-xs font-bold transition-all duration-300 ${bgClass}`;
+        el.textContent = message;
+        container.appendChild(el);
+        setTimeout(() => {
+          el.style.opacity = '0';
+          setTimeout(() => el.remove(), 300);
+        }, 2400);
+      }
+
+      // --------------------------------------------------
+      // 2. カラーテーマ ＆ デフォルトリアクション定義
+      // --------------------------------------------------
+      const COLOR_THEMES = {
+        emerald: {
+          key: 'emerald',
+          name: 'エメラルド (緑)',
+          hex: '#10b981',
+          rgbaFill: 'rgba(16, 185, 129, 0.28)',
+          cardBorder: 'border-emerald-500/40',
+          cardBg: 'bg-emerald-500/10',
+          btnGrad: 'from-emerald-500 to-teal-600'
+        },
+        amber: {
+          key: 'amber',
+          name: 'アンバー (橙)',
+          hex: '#f59e0b',
+          rgbaFill: 'rgba(245, 158, 11, 0.28)',
+          cardBorder: 'border-amber-500/40',
+          cardBg: 'bg-amber-500/10',
+          btnGrad: 'from-amber-500 to-orange-600'
+        },
+        indigo: {
+          key: 'indigo',
+          name: 'インディゴ (青紫)',
+          hex: '#6366f1',
+          rgbaFill: 'rgba(99, 102, 241, 0.28)',
+          cardBorder: 'border-indigo-500/40',
+          cardBg: 'bg-indigo-500/10',
+          btnGrad: 'from-indigo-500 to-blue-600'
+        },
+        rose: {
+          key: 'rose',
+          name: 'ローズ (赤桃)',
+          hex: '#f43f5e',
+          rgbaFill: 'rgba(244, 63, 94, 0.28)',
+          cardBorder: 'border-rose-500/40',
+          cardBg: 'bg-rose-500/10',
+          btnGrad: 'from-rose-500 to-pink-600'
+        },
+        cyan: {
+          key: 'cyan',
+          name: 'シアン (水色)',
+          hex: '#06b6d4',
+          rgbaFill: 'rgba(6, 182, 212, 0.28)',
+          cardBorder: 'border-cyan-500/40',
+          cardBg: 'bg-cyan-500/10',
+          btnGrad: 'from-cyan-500 to-sky-600'
+        },
+        purple: {
+          key: 'purple',
+          name: 'パープル (紫)',
+          hex: '#a855f7',
+          rgbaFill: 'rgba(168, 85, 247, 0.28)',
+          cardBorder: 'border-purple-500/40',
+          cardBg: 'bg-purple-500/10',
+          btnGrad: 'from-purple-500 to-fuchsia-600'
+        }
+      };
+
+      const DEFAULT_REACTIONS = [
+        { id: 'good', shortLabel: 'なるほど！', label: 'いいね / なるほど！', emoji: '👍', themeKey: 'emerald', sentiment: 'positive', points: 10 },
+        { id: 'fun', shortLabel: 'おもしろい！', label: 'おもしろい / 最高', emoji: '🔥', themeKey: 'amber', sentiment: 'positive', points: 15 },
+        { id: 'bad', shortLabel: 'むずかしい…', label: 'むずかしい / Bad', emoji: '💦', themeKey: 'indigo', sentiment: 'negative', points: 10 },
+        { id: 'question', shortLabel: 'ちょっと待って', label: '質問あり / 待って', emoji: '✋', themeKey: 'rose', sentiment: 'negative', points: 20 }
+      ];
+
+      const REACTION_PRESETS = [
+        {
+          name: '標準バランス（デフォルト）',
+          desc: '👍なるほど / 🔥おもしろい / 💦むずかしい / ✋質問',
+          list: DEFAULT_REACTIONS
+        },
+        {
+          name: 'シンプル理解度チェック',
+          desc: '⭕よくわかる / ❌むずかしい(Bad) / 💡へぇ〜！ / ❓もう一度',
+          list: [
+            { id: 'good', shortLabel: 'よくわかる！', label: 'よくわかる / OK', emoji: '⭕', themeKey: 'emerald', sentiment: 'positive', points: 10 },
+            { id: 'bad', shortLabel: 'むずかしい(Bad)', label: 'むずかしい / Bad', emoji: '❌', themeKey: 'rose', sentiment: 'negative', points: 10 },
+            { id: 'fun', shortLabel: 'へぇ〜！', label: '新しい発見 / 納得', emoji: '💡', themeKey: 'amber', sentiment: 'positive', points: 15 },
+            { id: 'question', shortLabel: 'もう一度！', label: 'もう一度説明してほしい', emoji: '❓', themeKey: 'indigo', sentiment: 'negative', points: 15 }
+          ]
+        },
+        {
+          name: '講義テンポ・コンディション',
+          desc: '👍ちょうどいい / ⏩早すぎる / 🐢遅すぎる / 💤眠い・疲れた',
+          list: [
+            { id: 'good', shortLabel: 'ちょうどいい', label: 'ペースちょうどいい', emoji: '👍', themeKey: 'emerald', sentiment: 'positive', points: 10 },
+            { id: 'fast', shortLabel: '早すぎる…', label: '説明が早すぎる', emoji: '⏩', themeKey: 'rose', sentiment: 'negative', points: 10 },
+            { id: 'slow', shortLabel: '遅すぎる', label: 'もう少し早くてもOK', emoji: '🐢', themeKey: 'cyan', sentiment: 'negative', points: 10 },
+            { id: 'sleepy', shortLabel: '眠い・疲れた', label: '眠い・小休憩したい', emoji: '💤', themeKey: 'purple', sentiment: 'negative', points: 10 }
+          ]
+        }
+      ];
+
+      function cloneDeep(obj) {
+        return JSON.parse(JSON.stringify(obj));
+      }
+
+      // --------------------------------------------------
+      // 3. アプリケーション状態 (State)
+      // --------------------------------------------------
+      let urlRoom = 'LECTURE-101';
+      let urlRoleStudent = false;
+      try {
+        const params = new URLSearchParams(window.location.search);
+        if (params.get('room')) urlRoom = params.get('room').toUpperCase();
+        if (params.get('role') === 'student' || params.get('mode') === 'student') {
+          urlRoleStudent = true;
+        }
+      } catch (e) {}
+
+      const state = {
+        userId: 'stu-' + Math.random().toString(36).substring(2, 8),
+        roomId: urlRoom,
+        viewMode: 'student',          // 'student' | 'instructor'
+        isStudentLocked: urlRoleStudent, // QR読取時など受講生画面へ完全ロックするか
+        pinLockEnabled: true,
+        instructorPin: '1234',
+        isInstructorUnlocked: false,
+        reactionList: cloneDeep(DEFAULT_REACTIONS),
+        draftReactions: cloneDeep(DEFAULT_REACTIONS),
+        events: [],                   // { id, roomId, type, emoji, timestamp, userId }
+        seenEventIds: new Set(),      // 重複受信防止セット
+        personalScore: 0,
+        combo: 0,
+        clickHistory: [],             // 直近1秒間のクリックタイムスタンプ
+        bucketSizeSec: 1800,          // デフォルト集計単位: 30分 (1800秒)
+        timeWindowMin: 90,            // デフォルト表示枠: 1時間半 (90分)
+        chartType: 'bar',             // 'bar' | 'line'
+        simActive: false,
+        simSpeed: 'normal',
+        chartBuckets: [],             // マウスホバーツールチップ用キャッシュ
+        cloudConnected: false,
+        brokerIndex: 0,
+        mqttClient: null
+      };
+
+      let comboResetTimer = null;
+      let simIntervalId = null;
+
+      // --------------------------------------------------
+      // 3.5. サーバー構築不要の端末間クラウド同期 (MQTT over WebSockets)
+      // --------------------------------------------------
+      const PUBLIC_WSS_BROKERS = [
+        { name: 'EMQX Cloud', url: 'wss://broker.emqx.io:8084/mqtt' },
+        { name: 'HiveMQ Cloud', url: 'wss://broker.hivemq.com:8884/mqtt' },
+        { name: 'Eclipse Mosquitto', url: 'wss://test.mosquitto.org:8081/mqtt' }
+      ];
+
+      function getMqttTopic(roomId) {
+        const cleanRoom = String(roomId || 'LECTURE-101').replace(/[^A-Z0-9_-]/gi, '_');
+        return `lecture_pulse_v3_sync/${cleanRoom}`;
+      }
+
+      function updateCloudBadgeUI(statusKey, detailText) {
+        const badge = document.getElementById('cloud-status-badge');
+        const dot = document.getElementById('cloud-status-dot');
+        const text = document.getElementById('cloud-status-text');
+        if (!badge || !dot || !text) return;
+
+        if (statusKey === 'connected') {
+          badge.className = 'inline-flex items-center gap-1.5 px-2.5 py-0.5 text-[11px] font-bold rounded-full bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 transition cursor-pointer';
+          dot.className = 'w-2 h-2 rounded-full bg-emerald-400 animate-pulse';
+          text.textContent = detailText || '🌐 クラウド同期中 (別端末OK)';
+        } else if (statusKey === 'connecting') {
+          badge.className = 'inline-flex items-center gap-1.5 px-2.5 py-0.5 text-[11px] font-bold rounded-full bg-amber-500/20 border border-amber-500/40 text-amber-300 transition cursor-pointer';
+          dot.className = 'w-2 h-2 rounded-full bg-amber-400 animate-ping';
+          text.textContent = detailText || 'クラウド接続中...';
+        } else {
+          badge.className = 'inline-flex items-center gap-1.5 px-2.5 py-0.5 text-[11px] font-bold rounded-full bg-slate-800 border border-slate-700 text-slate-400 transition cursor-pointer';
+          dot.className = 'w-2 h-2 rounded-full bg-slate-500';
+          text.textContent = detailText || '同一PC内のみ同期 (タップで再接続)';
+        }
+      }
+
+      function initCloudSync(forceNextBroker) {
+        if (typeof window.mqtt === 'undefined') {
+          updateCloudBadgeUI('offline', '同一PC内同期モード');
+          return;
+        }
+
+        if (state.mqttClient) {
+          try { state.mqttClient.end(true); } catch (e) {}
+          state.mqttClient = null;
+        }
+
+        if (forceNextBroker) {
+          state.brokerIndex = (state.brokerIndex + 1) % PUBLIC_WSS_BROKERS.length;
+        }
+
+        const broker = PUBLIC_WSS_BROKERS[state.brokerIndex];
+        updateCloudBadgeUI('connecting', `接続中 (${broker.name})...`);
+
+        try {
+          const client = window.mqtt.connect(broker.url, {
+            clientId: 'lp_' + state.userId + '_' + Math.random().toString(16).slice(2, 6),
+            clean: true,
+            connectTimeout: 5000,
+            reconnectPeriod: 4000
+          });
+
+          state.mqttClient = client;
+
+          client.on('connect', () => {
+            state.cloudConnected = true;
+            updateCloudBadgeUI('connected', '🌐 クラウド同期中 (別端末OK)');
+            const topic = getMqttTopic(state.roomId);
+            client.subscribe(topic, { qos: 0 }, (err) => {
+              if (!err) {
+                // 参加時に現在の部屋の設定・履歴をリクエスト
+                publishSyncMessage({
+                  kind: 'REQUEST_STATE',
+                  roomId: state.roomId,
+                  senderId: state.userId
+                });
+              }
+            });
+          });
+
+          client.on('message', (_topic, payloadBuffer) => {
+            try {
+              const msg = JSON.parse(payloadBuffer.toString());
+              handleIncomingSyncMessage(msg);
+            } catch (e) {}
+          });
+
+          client.on('error', () => {
+            // 接続エラー時は別の中継サーバーへ自動フォールバック
+            state.cloudConnected = false;
+            try { client.end(true); } catch (e) {}
+            state.brokerIndex = (state.brokerIndex + 1) % PUBLIC_WSS_BROKERS.length;
+            setTimeout(() => initCloudSync(false), 1200);
+          });
+
+          client.on('offline', () => {
+            state.cloudConnected = false;
+            updateCloudBadgeUI('connecting', '再接続待機中...');
+          });
+        } catch (e) {
+          updateCloudBadgeUI('offline', '同一PC内同期モード');
+        }
+      }
+
+      function publishSyncMessage(msgObj) {
+        if (!msgObj) return;
+        msgObj.senderId = state.userId;
+        msgObj.roomId = state.roomId;
+
+        // 1) 同一PCの別タブへ即時送信
+        if (safeChannel) {
+          try { safeChannel.postMessage(msgObj); } catch (e) {}
+        }
+
+        // 2) クラウド経由で別端末（受講生のスマホ・講師PC）へリアルタイム送信
+        if (state.mqttClient && state.cloudConnected) {
+          try {
+            state.mqttClient.publish(
+              getMqttTopic(state.roomId),
+              JSON.stringify(msgObj),
+              { qos: 0 }
+            );
+          } catch (e) {}
+        }
+      }
+
+      function handleIncomingSyncMessage(msg) {
+        if (!msg || msg.roomId !== state.roomId) return;
+        if (msg.senderId && msg.senderId === state.userId) return;
+
+        if (msg.kind === 'NEW_REACTION' && msg.event) {
+          if (state.seenEventIds.has(msg.event.id)) return;
+          state.seenEventIds.add(msg.event.id);
+          state.events.push(msg.event);
+          saveRoomData();
+          spawnFloatingEmoji(msg.event.emoji);
+          renderAll();
+        } else if (msg.kind === 'CONFIG_UPDATED' && Array.isArray(msg.reactionList)) {
+          state.reactionList = msg.reactionList;
+          saveRoomData();
+          renderStudentReactionButtons();
+          renderAll();
+          showToast('🔄 講師からリアクション設定が同期されました', 'emerald');
+        } else if (msg.kind === 'RESET_ROOM') {
+          state.events = [];
+          state.seenEventIds.clear();
+          saveRoomData();
+          renderAll();
+        } else if (msg.kind === 'REQUEST_STATE') {
+          // 講師画面を開いている端末、またはイベントを多く保持している端末から最新状態を返答
+          if (state.viewMode === 'instructor' || state.events.length > 0) {
+            publishSyncMessage({
+              kind: 'SYNC_STATE_SNAPSHOT',
+              roomId: state.roomId,
+              reactionList: state.reactionList,
+              recentEvents: state.events.slice(-400)
+            });
+          }
+        } else if (msg.kind === 'SYNC_STATE_SNAPSHOT') {
+          let updated = false;
+          if (Array.isArray(msg.reactionList) && msg.reactionList.length >= 2) {
+            state.reactionList = msg.reactionList;
+            updated = true;
+          }
+          if (Array.isArray(msg.recentEvents)) {
+            msg.recentEvents.forEach((ev) => {
+              if (ev && ev.id && !state.seenEventIds.has(ev.id)) {
+                state.seenEventIds.add(ev.id);
+                state.events.push(ev);
+                updated = true;
+              }
+            });
+            state.events.sort((a, b) => a.timestamp - b.timestamp);
+          }
+          if (updated) {
+            saveRoomData();
+            renderStudentReactionButtons();
+            renderAll();
+          }
+        }
+      }
+
+      // --------------------------------------------------
+      // 4. ローカル保存データの読み込み・同期
+      // --------------------------------------------------
+      function getRoomStorageKey(roomId) {
+        return `lp_data_${roomId}`;
+      }
+
+      function loadRoomData() {
+        state.seenEventIds.clear();
+        const raw = SafeStorage.getItem(getRoomStorageKey(state.roomId));
+        if (raw) {
+          try {
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed.reactionList) && parsed.reactionList.length >= 2) {
+              state.reactionList = parsed.reactionList;
+            }
+            if (Array.isArray(parsed.events)) {
+              state.events = parsed.events;
+              state.events.forEach((ev) => {
+                if (ev && ev.id) state.seenEventIds.add(ev.id);
+              });
+            }
+            if (typeof parsed.instructorPin === 'string' && parsed.instructorPin) {
+              state.instructorPin = parsed.instructorPin;
+            }
+            if (typeof parsed.pinLockEnabled === 'boolean') {
+              state.pinLockEnabled = parsed.pinLockEnabled;
+            }
+            return;
+          } catch (e) {}
+        }
+        // 新しいルームの場合は空の状態で待機（クラウドから自動同期）
+        state.reactionList = cloneDeep(DEFAULT_REACTIONS);
+        state.events = [];
+      }
+
+      function saveRoomData() {
+        const payload = {
+          reactionList: state.reactionList,
+          events: state.events.slice(-2500),
+          instructorPin: state.instructorPin,
+          pinLockEnabled: state.pinLockEnabled
+        };
+        SafeStorage.setItem(getRoomStorageKey(state.roomId), JSON.stringify(payload));
+      }
+
+      if (safeChannel) {
+        safeChannel.onmessage = function (ev) {
+          handleIncomingSyncMessage(ev.data);
+        };
+      }
+
+      // --------------------------------------------------
+      // 5. フローティング絵文字エフェクト
+      // --------------------------------------------------
+      function spawnFloatingEmoji(emojiChar) {
+        const layer = document.getElementById('floating-layer');
+        if (!layer) return;
+        const el = document.createElement('div');
+        el.className = 'floating-emoji';
+        el.textContent = emojiChar || '👍';
+        const left = 12 + Math.random() * 76;
+        const sizeRem = 1.6 + Math.random() * 1.1;
+        const durationSec = 2.0 + Math.random() * 1.0;
+        el.style.left = `${left}%`;
+        el.style.fontSize = `${sizeRem}rem`;
+        el.style.animationDuration = `${durationSec}s`;
+        layer.appendChild(el);
+        setTimeout(() => {
+          el.remove();
+        }, durationSec * 1000);
+      }
+
+      // --------------------------------------------------
+      // 6. リアクション送信処理 (受講生タップ & AIデモ共通)
+      // --------------------------------------------------
+      function sendReaction(reactionId, isSimulated) {
+        const now = Date.now();
+        const item = state.reactionList.find((r) => r.id === reactionId) || state.reactionList[0];
+        if (!item) return;
+
+        if (!isSimulated) {
+          // 1秒間に3回までのレートリミット判定
+          state.clickHistory = state.clickHistory.filter((t) => now - t < 1000);
+          if (state.clickHistory.length >= 3) {
+            const warnEl = document.getElementById('cooldown-warning');
+            if (warnEl) {
+              warnEl.classList.remove('hidden');
+              setTimeout(() => warnEl.classList.add('hidden'), 650);
+            }
+            updateEnergyBars();
+            return;
+          }
+          state.clickHistory.push(now);
+          updateEnergyBars();
+
+          // コンボ＆スコア加算
+          state.combo += 1;
+          const bonus = Math.min(Math.floor(state.combo / 5) * 5, 30);
+          state.personalScore += (Number(item.points) || 10) + bonus;
+
+          if (comboResetTimer) clearTimeout(comboResetTimer);
+          comboResetTimer = setTimeout(() => {
+            state.combo = 0;
+            renderStudentScoreCard();
+          }, 3500);
+        }
+
+        const newEv = {
+          id: `${now}-${Math.random().toString(36).substring(2, 6)}`,
+          roomId: state.roomId,
+          type: item.id,
+          emoji: item.emoji,
+          timestamp: now,
+          userId: isSimulated ? `sim-stu-${Math.floor(Math.random() * 35) + 1}` : state.userId
+        };
+
+        state.seenEventIds.add(newEv.id);
+        state.events.push(newEv);
+        saveRoomData();
+        spawnFloatingEmoji(item.emoji);
+
+        publishSyncMessage({
+          kind: 'NEW_REACTION',
+          roomId: state.roomId,
+          event: newEv
+        });
+
+        renderAll();
+      }
+
+      function updateEnergyBars() {
+        const now = Date.now();
+        const used = state.clickHistory.filter((t) => now - t < 1000).length;
+        const avail = Math.max(0, 3 - used);
+        for (let i = 0; i < 3; i++) {
+          const bar = document.getElementById(`energy-bar-${i}`);
+          if (!bar) continue;
+          if (i < avail) {
+            bar.className = 'h-2 rounded-full bg-emerald-400 shadow-sm shadow-emerald-500/50 transition-all duration-200';
+          } else {
+            bar.className = 'h-2 rounded-full bg-slate-800 transition-all duration-200';
+          }
+        }
+      }
+
+      // --------------------------------------------------
+      // 7. 受講生画面・講師画面のUIレンダリング
+      // --------------------------------------------------
+      function renderRoleAndModeVisibility() {
+        const switcherGroup = document.getElementById('mode-switcher-group');
+        const btnOpenQr = document.getElementById('btn-open-qr');
+        const studentOnlyPill = document.getElementById('student-only-pill');
+        const lockBanner = document.getElementById('student-lock-banner');
+        const inputRoom = document.getElementById('input-room');
+        const viewStudent = document.getElementById('view-student');
+        const viewInstructor = document.getElementById('view-instructor');
+        const tabStudent = document.getElementById('tab-btn-student');
+        const tabInstructor = document.getElementById('tab-btn-instructor');
+        const lockIndicator = document.getElementById('instructor-lock-indicator');
+        const btnPinConfigLabel = document.getElementById('btn-pin-config-label');
+
+        if (state.isStudentLocked) {
+          // 受講生専用ロック時：講師画面へ切り替えるタブ・QR共有ボタンを完全非表示にし、強制的に受講生画面にする
+          state.viewMode = 'student';
+          switcherGroup.classList.add('hidden');
+          switcherGroup.classList.remove('flex');
+          btnOpenQr.classList.add('hidden');
+          studentOnlyPill.classList.remove('hidden');
+          lockBanner.classList.remove('hidden');
+          lockBanner.classList.add('flex');
+          inputRoom.readOnly = true;
+        } else {
+          switcherGroup.classList.remove('hidden');
+          switcherGroup.classList.add('flex');
+          btnOpenQr.classList.remove('hidden');
+          studentOnlyPill.classList.add('hidden');
+          lockBanner.classList.add('hidden');
+          lockBanner.classList.remove('flex');
+          inputRoom.readOnly = false;
+        }
+
+        if (lockIndicator) {
+          if (state.pinLockEnabled && !state.isInstructorUnlocked) {
+            lockIndicator.classList.remove('hidden');
+          } else {
+            lockIndicator.classList.add('hidden');
+          }
+        }
+
+        if (btnPinConfigLabel) {
+          btnPinConfigLabel.textContent = state.pinLockEnabled
+            ? `🔐 PIN保護ON (${state.instructorPin})`
+            : '🔓 PIN保護OFF';
+        }
+
+        if (state.viewMode === 'student') {
+          viewStudent.classList.remove('hidden');
+          viewInstructor.classList.add('hidden');
+          tabStudent.className = 'flex-1 sm:flex-initial flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-xs sm:text-sm font-bold transition-all bg-indigo-600 text-white shadow-md shadow-indigo-600/30 cursor-pointer';
+          tabInstructor.className = 'flex-1 sm:flex-initial flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-xs sm:text-sm font-bold transition-all text-slate-400 hover:text-slate-200 cursor-pointer';
+        } else {
+          viewStudent.classList.add('hidden');
+          viewInstructor.classList.remove('hidden');
+          tabStudent.className = 'flex-1 sm:flex-initial flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-xs sm:text-sm font-bold transition-all text-slate-400 hover:text-slate-200 cursor-pointer';
+          tabInstructor.className = 'flex-1 sm:flex-initial flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-xs sm:text-sm font-bold transition-all bg-emerald-600 text-white shadow-md shadow-emerald-600/30 cursor-pointer';
+        }
+      }
+
+      function renderStudentScoreCard() {
+        const scoreEl = document.getElementById('student-score');
+        const comboEl = document.getElementById('student-combo');
+        const comboBox = document.getElementById('student-combo-box');
+        if (scoreEl) scoreEl.textContent = state.personalScore.toLocaleString();
+        if (comboEl) comboEl.textContent = state.combo;
+        if (comboBox) {
+          if (state.combo >= 10) {
+            comboBox.className = 'inline-flex flex-col items-end px-3.5 py-1.5 rounded-xl border bg-amber-500/20 border-amber-400 text-amber-300 scale-105 transition-all duration-200';
+          } else if (state.combo > 0) {
+            comboBox.className = 'inline-flex flex-col items-end px-3.5 py-1.5 rounded-xl border bg-indigo-500/20 border-indigo-400/50 text-indigo-300 transition-all duration-200';
+          } else {
+            comboBox.className = 'inline-flex flex-col items-end px-3.5 py-1.5 rounded-xl border bg-slate-950 border-slate-800 text-slate-500 transition-all duration-200';
+          }
+        }
+      }
+
+      function renderStudentReactionButtons() {
+        const grid = document.getElementById('student-reaction-grid');
+        if (!grid) return;
+        grid.innerHTML = '';
+
+        const counts = getTotalsById();
+        state.reactionList.forEach((item) => {
+          const theme = COLOR_THEMES[item.themeKey] || COLOR_THEMES.emerald;
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = `group relative overflow-hidden rounded-2xl p-5 border ${theme.cardBorder} bg-gradient-to-br ${theme.btnGrad} text-white shadow-lg active:scale-95 transition-all duration-150 flex flex-col items-center justify-center text-center select-none cursor-pointer`;
+          btn.innerHTML = `
+            <div class="text-5xl mb-2 transform group-hover:scale-110 group-active:scale-125 transition-transform">${escapeHtml(item.emoji)}</div>
+            <div class="font-extrabold text-base leading-snug drop-shadow">${escapeHtml(item.shortLabel)}</div>
+            <div class="text-[11px] text-white/85 mt-0.5 font-medium line-clamp-1">${escapeHtml(item.label)} (+${Number(item.points) || 10}pt)</div>
+            <div data-badge-id="${escapeHtml(item.id)}" class="mt-3 px-2.5 py-0.5 rounded-full bg-black/30 backdrop-blur-sm text-xs font-mono font-bold">
+              全体: ${(counts[item.id] || 0).toLocaleString()}
+            </div>
+          `;
+          btn.addEventListener('click', () => {
+            sendReaction(item.id, false);
+          });
+          grid.appendChild(btn);
+        });
+      }
+
+      function getTotalsById() {
+        const counts = { all: 0, pos: 0, neg: 0 };
+        const rMap = {};
+        state.reactionList.forEach((r) => {
+          counts[r.id] = 0;
+          rMap[r.id] = r;
+        });
+        state.events.forEach((ev) => {
+          if (counts[ev.type] === undefined) counts[ev.type] = 0;
+          counts[ev.type] += 1;
+          counts.all += 1;
+          const cfg = rMap[ev.type];
+          if (cfg && cfg.sentiment === 'negative') counts.neg += 1;
+          else counts.pos += 1;
+        });
+        return counts;
+      }
+
+      function computeStatsAndBuckets() {
+        const now = Date.now();
+        const counts = getTotalsById();
+        const users = new Set();
+        state.events.forEach((e) => {
+          if (e.userId) users.add(e.userId);
+        });
+        const participantCount = Math.max(1, users.size);
+
+        // 直近1分・15秒の勢い
+        const oneMinAgo = now - 60 * 1000;
+        const fifteenSecAgo = now - 15 * 1000;
+        const recent1m = state.events.filter((e) => e.timestamp >= oneMinAgo).length;
+        const recent15s = state.events.filter((e) => e.timestamp >= fifteenSecAgo).length;
+
+        const heat15 = Math.min(100, Math.round((recent15s / 10) * 100));
+        const heat60 = Math.min(100, Math.round((recent1m / 40) * 100));
+        const heatPercent = Math.max(heat15, heat60);
+        const isFever = heatPercent >= 80;
+
+        const totalSent = counts.pos + counts.neg;
+        const posRatio = totalSent > 0 ? Math.round((counts.pos / totalSent) * 100) : 50;
+
+        // 単位時間バケット生成（30分 / 1時間 / 1時間半 にも対応）
+        const bucketMs = state.bucketSizeSec * 1000;
+        const windowMs = Math.max(state.timeWindowMin * 60 * 1000, bucketMs * 3);
+        const bucketCount = Math.min(60, Math.max(3, Math.ceil(windowMs / bucketMs)));
+        const alignedEnd = Math.ceil(now / bucketMs) * bucketMs;
+        const alignedStart = alignedEnd - bucketCount * bucketMs;
+
+        const buckets = [];
+        for (let i = 0; i < bucketCount; i++) {
+          const bStart = alignedStart + i * bucketMs;
+          const bEnd = bStart + bucketMs;
+          const dStart = new Date(bStart);
+          const dEnd = new Date(bEnd);
+
+          const hm = (d) => d.toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' });
+          let label = '';
+          if (state.bucketSizeSec >= 1800) {
+            label = `${hm(dStart)}〜${hm(dEnd)}`;
+          } else if (state.bucketSizeSec >= 60) {
+            label = hm(dStart);
+          } else {
+            label = dStart.toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+          }
+
+          const bObj = {
+            startTime: bStart,
+            endTime: bEnd,
+            label,
+            total: 0
+          };
+          state.reactionList.forEach((r) => {
+            bObj[r.id] = 0;
+          });
+          buckets.push(bObj);
+        }
+
+        state.events.forEach((ev) => {
+          if (ev.timestamp >= alignedStart && ev.timestamp <= alignedEnd) {
+            const idx = Math.min(bucketCount - 1, Math.max(0, Math.floor((ev.timestamp - alignedStart) / bucketMs)));
+            const target = buckets[idx];
+            if (target) {
+              if (target[ev.type] === undefined) target[ev.type] = 0;
+              target[ev.type] += 1;
+              target.total += 1;
+            }
+          }
+        });
+
+        let peakBucket = null;
+        buckets.forEach((b) => {
+          if (!peakBucket || b.total > peakBucket.total) peakBucket = b;
+        });
+
+        return {
+          counts,
+          participantCount,
+          rpm: recent1m,
+          heatPercent,
+          isFever,
+          posRatio,
+          buckets,
+          peakBucket
+        };
+      }
+
+      // --------------------------------------------------
+      // 8. カスタム HTML5 Canvas チャート描画エンジン
+      // --------------------------------------------------
+      function drawReactionChart(buckets) {
+        state.chartBuckets = buckets;
+        const canvas = document.getElementById('reaction-chart-canvas');
+        if (!canvas) return;
+        const rect = canvas.parentElement.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        const width = Math.max(300, rect.width - 24);
+        const height = Math.max(220, rect.height - 24);
+
+        canvas.width = width * dpr;
+        canvas.height = height * dpr;
+        canvas.style.width = `${width}px`;
+        canvas.style.height = `${height}px`;
+
+        const ctx = canvas.getContext('2d');
+        ctx.scale(dpr, dpr);
+        ctx.clearRect(0, 0, width, height);
+
+        const padLeft = 44;
+        const padRight = 18;
+        const padTop = 18;
+        const padBottom = 42;
+        const plotW = width - padLeft - padRight;
+        const plotH = height - padTop - padBottom;
+
+        // 最大値の計算
+        let maxVal = 5;
+        buckets.forEach((b) => {
+          if (state.chartType === 'bar') {
+            if (b.total > maxVal) maxVal = b.total;
+          } else {
+            state.reactionList.forEach((r) => {
+              if ((b[r.id] || 0) > maxVal) maxVal = b[r.id];
+            });
+          }
+        });
+        maxVal = Math.ceil(maxVal * 1.15);
+
+        // 背景グリッド線とY軸目盛り
+        const gridSteps = 4;
+        ctx.font = '11px Inter, sans-serif';
+        ctx.textAlign = 'right';
+        ctx.textBaseline = 'middle';
+
+        for (let i = 0; i <= gridSteps; i++) {
+          const val = Math.round((maxVal / gridSteps) * i);
+          const y = padTop + plotH - (val / maxVal) * plotH;
+          ctx.strokeStyle = '#1e293b';
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(padLeft, y);
+          ctx.lineTo(padLeft + plotW, y);
+          ctx.stroke();
+
+          ctx.fillStyle = '#94a3b8';
+          ctx.fillText(String(val), padLeft - 8, y);
+        }
+
+        const n = buckets.length;
+        if (n === 0) return;
+
+        // X軸ラベル描画
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        const labelStep = Math.max(1, Math.ceil(n / 8));
+
+        for (let i = 0; i < n; i++) {
+          const xCenter = padLeft + ((i + 0.5) / n) * plotW;
+          buckets[i]._xCenter = xCenter;
+          buckets[i]._colWidth = plotW / n;
+
+          if (i % labelStep === 0 || i === n - 1) {
+            ctx.fillStyle = '#94a3b8';
+            ctx.fillText(buckets[i].label, xCenter, padTop + plotH + 10);
+          }
+        }
+
+        if (state.chartType === 'bar') {
+          // 積み上げ棒グラフ
+          const barW = Math.min(48, Math.max(8, (plotW / n) * 0.62));
+          for (let i = 0; i < n; i++) {
+            const b = buckets[i];
+            const x = b._xCenter - barW / 2;
+            let currentBottomY = padTop + plotH;
+
+            state.reactionList.forEach((r) => {
+              const v = b[r.id] || 0;
+              if (v <= 0) return;
+              const h = (v / maxVal) * plotH;
+              const theme = COLOR_THEMES[r.themeKey] || COLOR_THEMES.emerald;
+              ctx.fillStyle = theme.hex;
+              ctx.beginPath();
+              ctx.roundRect(x, currentBottomY - h, barW, Math.max(2, h), 3);
+              ctx.fill();
+              currentBottomY -= h;
+            });
+          }
+        } else {
+          // 折れ線＋面グラフ
+          state.reactionList.forEach((r) => {
+            const theme = COLOR_THEMES[r.themeKey] || COLOR_THEMES.emerald;
+            const pts = buckets.map((b, i) => {
+              const x = padLeft + ((i + 0.5) / n) * plotW;
+              const v = b[r.id] || 0;
+              const y = padTop + plotH - (v / maxVal) * plotH;
+              return { x, y };
+            });
+
+            // 面塗りつぶし
+            ctx.fillStyle = theme.rgbaFill;
+            ctx.beginPath();
+            ctx.moveTo(pts[0].x, padTop + plotH);
+            pts.forEach((p) => ctx.lineTo(p.x, p.y));
+            ctx.lineTo(pts[pts.length - 1].x, padTop + plotH);
+            ctx.closePath();
+            ctx.fill();
+
+            // 折れ線
+            ctx.strokeStyle = theme.hex;
+            ctx.lineWidth = 2.5;
+            ctx.beginPath();
+            pts.forEach((p, idx) => {
+              if (idx === 0) ctx.moveTo(p.x, p.y);
+              else ctx.lineTo(p.x, p.y);
+            });
+            ctx.stroke();
+
+            // データポイント丸印
+            pts.forEach((p) => {
+              ctx.fillStyle = theme.hex;
+              ctx.beginPath();
+              ctx.arc(p.x, p.y, 3.5, 0, Math.PI * 2);
+              ctx.fill();
+            });
+          });
+        }
+      }
+
+      // --------------------------------------------------
+      // 9. 全体UIの一括更新
+      // --------------------------------------------------
+      function renderAll() {
+        const stats = computeStatsAndBuckets();
+
+        // ヘッダー＆ヒートアップメーター更新
+        const heatText = document.getElementById('heat-percent-text');
+        const heatFill = document.getElementById('heat-bar-fill');
+        const feverBadge = document.getElementById('fever-badge');
+        const headerRpm = document.getElementById('header-rpm');
+        const headerTotal = document.getElementById('header-total');
+        const headerPart = document.getElementById('header-participants');
+        const mobilePart = document.getElementById('mobile-participants');
+        const studentScoreCard = document.getElementById('student-score-card');
+
+        if (heatText) heatText.textContent = `${stats.heatPercent}%`;
+        if (heatFill) heatFill.style.width = `${Math.max(4, stats.heatPercent)}%`;
+        if (headerRpm) headerRpm.textContent = stats.rpm;
+        if (headerTotal) headerTotal.textContent = stats.counts.all.toLocaleString();
+        if (headerPart) headerPart.textContent = stats.participantCount;
+        if (mobilePart) mobilePart.textContent = stats.participantCount;
+
+        if (stats.isFever) {
+          if (feverBadge) feverBadge.classList.remove('hidden');
+          if (studentScoreCard) studentScoreCard.classList.add('fever-glow');
+        } else {
+          if (feverBadge) feverBadge.classList.add('hidden');
+          if (studentScoreCard) studentScoreCard.classList.remove('fever-glow');
+        }
+
+        // 受講生画面のスコアとバッジ更新
+        renderStudentScoreCard();
+        state.reactionList.forEach((item) => {
+          const badge = document.querySelector(`[data-badge-id="${item.id}"]`);
+          if (badge) {
+            badge.textContent = `全体: ${(stats.counts[item.id] || 0).toLocaleString()}`;
+          }
+        });
+
+        const stuPosText = document.getElementById('student-positive-ratio-text');
+        const stuPosBar = document.getElementById('student-pos-bar');
+        const stuNegBar = document.getElementById('student-neg-bar');
+        const stuPosCount = document.getElementById('student-pos-count');
+        const stuNegCount = document.getElementById('student-neg-count');
+
+        if (stuPosText) stuPosText.textContent = `${stats.posRatio}% ポジティブ`;
+        if (stuPosBar) stuPosBar.style.width = `${stats.posRatio}%`;
+        if (stuNegBar) stuNegBar.style.width = `${100 - stats.posRatio}%`;
+        if (stuPosCount) stuPosCount.textContent = stats.counts.pos;
+        if (stuNegCount) stuNegCount.textContent = stats.counts.neg;
+
+        // 講師画面が表示されている場合はカード・グラフ・テーブルも更新
+        if (state.viewMode === 'instructor') {
+          renderInstructorCards(stats);
+          renderChartLegend();
+          drawReactionChart(stats.buckets);
+          renderBreakdownTable(stats.buckets);
+          renderInstructorInsights(stats);
+        }
+      }
+
+      function renderInstructorCards(stats) {
+        const container = document.getElementById('instructor-summary-cards');
+        if (!container) return;
+        container.innerHTML = '';
+
+        state.reactionList.forEach((item) => {
+          const theme = COLOR_THEMES[item.themeKey] || COLOR_THEMES.emerald;
+          const cnt = stats.counts[item.id] || 0;
+          const pct = stats.counts.all > 0 ? Math.round((cnt / stats.counts.all) * 100) : 0;
+          const card = document.createElement('div');
+          card.className = `rounded-2xl p-4 border ${theme.cardBorder} ${theme.cardBg} flex items-center justify-between`;
+          card.innerHTML = `
+            <div>
+              <span class="text-xs font-bold text-slate-300 block">${escapeHtml(item.label)}</span>
+              <div class="flex items-baseline gap-2 mt-1">
+                <span class="text-3xl font-black font-mono text-white">${cnt.toLocaleString()}</span>
+                <span class="text-xs font-mono text-slate-400">(${pct}%)</span>
+              </div>
+            </div>
+            <div class="text-4xl select-none">${escapeHtml(item.emoji)}</div>
+          `;
+          container.appendChild(card);
+        });
+      }
+
+      function renderChartLegend() {
+        const legend = document.getElementById('chart-legend');
+        if (!legend) return;
+        legend.innerHTML = '';
+        state.reactionList.forEach((r) => {
+          const theme = COLOR_THEMES[r.themeKey] || COLOR_THEMES.emerald;
+          const item = document.createElement('div');
+          item.className = 'flex items-center gap-1.5 font-bold text-slate-300';
+          item.innerHTML = `
+            <span class="w-3 h-3 rounded-sm inline-block" style="background-color: ${theme.hex}"></span>
+            <span>${escapeHtml(r.emoji)} ${escapeHtml(r.shortLabel)}</span>
+          `;
+          legend.appendChild(item);
+        });
+      }
+
+      function renderBreakdownTable(buckets) {
+        const thead = document.getElementById('breakdown-thead');
+        const tbody = document.getElementById('breakdown-tbody');
+        const badge = document.getElementById('table-interval-badge');
+        if (!thead || !tbody) return;
+
+        const bucketNameMap = {
+          1800: '30分ごと',
+          3600: '1時間ごと',
+          5400: '1時間半(90分)ごと',
+          300: '5分ごと',
+          60: '1分ごと',
+          10: '10秒ごと'
+        };
+        if (badge) badge.textContent = `集計単位: ${bucketNameMap[state.bucketSizeSec] || state.bucketSizeSec + '秒'}`;
+
+        thead.innerHTML = `
+          <tr>
+            <th class="py-2.5 px-3">時間帯</th>
+            ${state.reactionList.map((r) => `<th class="py-2.5 px-3">${escapeHtml(r.emoji)} ${escapeHtml(r.shortLabel)}</th>`).join('')}
+            <th class="py-2.5 px-3 text-emerald-400">合計</th>
+          </tr>
+        `;
+
+        // 直近最大8行を表示
+        const recentRows = buckets.slice(-8);
+        tbody.innerHTML = recentRows.map((b) => `
+          <tr class="hover:bg-slate-900/50">
+            <td class="py-2 px-3 text-slate-300 font-bold">${escapeHtml(b.label)}</td>
+            ${state.reactionList.map((r) => `<td class="py-2 px-3 text-slate-300">${b[r.id] || 0}</td>`).join('')}
+            <td class="py-2 px-3 font-bold text-emerald-400">${b.total}</td>
+          </tr>
+        `).join('');
+      }
+
+      function renderInstructorInsights(stats) {
+        const posLabel = document.getElementById('ins-pos-label');
+        const negLabel = document.getElementById('ins-neg-label');
+        const posBar = document.getElementById('ins-pos-bar');
+        const negBar = document.getElementById('ins-neg-bar');
+        const totalEl = document.getElementById('ins-total-count');
+        const rpmEl = document.getElementById('ins-rpm');
+        const peakEl = document.getElementById('ins-peak-time');
+
+        if (posLabel) posLabel.textContent = `ポジティブ反応: ${stats.posRatio}% (${stats.counts.pos}件)`;
+        if (negLabel) negLabel.textContent = `フォロー推奨反応: ${100 - stats.posRatio}% (${stats.counts.neg}件)`;
+        if (posBar) posBar.style.width = `${stats.posRatio}%`;
+        if (negBar) negBar.style.width = `${100 - stats.posRatio}%`;
+        if (totalEl) totalEl.textContent = stats.counts.all.toLocaleString();
+        if (rpmEl) rpmEl.textContent = stats.rpm;
+        if (peakEl) {
+          peakEl.textContent = stats.peakBucket && stats.peakBucket.total > 0
+            ? `${stats.peakBucket.label} (${stats.peakBucket.total}件)`
+            : '---';
+        }
+      }
+
+      // --------------------------------------------------
+      // 10. 90分講義サンプルデータ生成 ＆ AIデモ連打機能
+      // --------------------------------------------------
+      function generate90MinLectureSample() {
+        const now = Date.now();
+        const ninetyMinMs = 90 * 60 * 1000;
+        const added = [];
+
+        for (let i = 0; i < 85; i++) {
+          const offset = Math.floor(Math.random() * ninetyMinMs);
+          const rIdx = Math.floor(Math.pow(Math.random(), 1.2) * state.reactionList.length);
+          const item = state.reactionList[rIdx] || state.reactionList[0];
+          const evObj = {
+            id: `sample-${now}-${i}`,
+            roomId: state.roomId,
+            type: item.id,
+            emoji: item.emoji,
+            timestamp: now - offset,
+            userId: `sample-stu-${(i % 28) + 1}`
+          };
+          state.seenEventIds.add(evObj.id);
+          added.push(evObj);
+        }
+
+        state.events = state.events.concat(added).sort((a, b) => a.timestamp - b.timestamp);
+        saveRoomData();
+        publishSyncMessage({
+          kind: 'SYNC_STATE_SNAPSHOT',
+          roomId: state.roomId,
+          reactionList: state.reactionList,
+          recentEvents: state.events.slice(-400)
+        });
+        renderAll();
+        showToast('✨ 過去90分間のサンプル講義データを生成・同期しました！', 'emerald');
+      }
+
+      function updateSimulatorTimer() {
+        if (simIntervalId) {
+          clearInterval(simIntervalId);
+          simIntervalId = null;
+        }
+        const btnIcon = document.getElementById('sim-btn-icon');
+        const btnText = document.getElementById('sim-btn-text');
+        const btnToggle = document.getElementById('btn-sim-toggle');
+
+        if (!state.simActive) {
+          if (btnIcon) btnIcon.textContent = '▶️';
+          if (btnText) btnText.textContent = '1人テスト用デモ (OFF)';
+          if (btnToggle) {
+            btnToggle.className = 'flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all bg-slate-800 text-slate-200 hover:bg-slate-700 cursor-pointer';
+          }
+          return;
+        }
+
+        if (btnIcon) btnIcon.textContent = '⏹️';
+        if (btnText) btnText.textContent = 'デモ自動送信中';
+        if (btnToggle) {
+          btnToggle.className = 'flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all bg-amber-500 text-slate-950 shadow-md shadow-amber-500/30 cursor-pointer';
+        }
+
+        const delay = state.simSpeed === 'fever' ? 350 : state.simSpeed === 'normal' ? 850 : 1700;
+        simIntervalId = setInterval(() => {
+          if (state.reactionList.length === 0) return;
+          const idx = Math.floor(Math.pow(Math.random(), 1.25) * state.reactionList.length);
+          const item = state.reactionList[idx] || state.reactionList[0];
+          sendReaction(item.id, true);
+        }, delay);
+      }
+
+      // --------------------------------------------------
+      // 11. リアクション種類カスタマイズモーダル処理
+      // --------------------------------------------------
+      function openReactionCustomizerModal() {
+        state.draftReactions = cloneDeep(state.reactionList);
+        renderPresetButtons();
+        renderCustomizerRows();
+        const m = document.getElementById('modal-customizer');
+        if (m) {
+          m.classList.remove('hidden');
+          m.classList.add('flex');
+        }
+      }
+
+      function renderPresetButtons() {
+        const container = document.getElementById('preset-buttons-container');
+        if (!container) return;
+        container.innerHTML = '';
+        REACTION_PRESETS.forEach((preset) => {
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'text-left p-3 rounded-xl bg-slate-950 hover:bg-slate-800 border border-slate-800 hover:border-indigo-500/50 transition cursor-pointer';
+          btn.innerHTML = `
+            <div class="text-xs font-extrabold text-indigo-300">${escapeHtml(preset.name)}</div>
+            <div class="text-[11px] text-slate-400 mt-1 line-clamp-2">${escapeHtml(preset.desc)}</div>
+          `;
+          btn.addEventListener('click', () => {
+            state.draftReactions = cloneDeep(preset.list);
+            renderCustomizerRows();
+          });
+          container.appendChild(btn);
+        });
+      }
+
+      function renderCustomizerRows() {
+        const container = document.getElementById('customizer-rows-container');
+        const countLabel = document.getElementById('customizer-count-label');
+        const addBtn = document.getElementById('btn-add-reaction-row');
+        if (!container) return;
+
+        if (countLabel) {
+          countLabel.textContent = `リアクションボタン一覧 (${state.draftReactions.length} / 8)`;
+        }
+        if (addBtn) {
+          addBtn.style.display = state.draftReactions.length >= 8 ? 'none' : 'inline-block';
+        }
+
+        container.innerHTML = '';
+        state.draftReactions.forEach((item, idx) => {
+          const row = document.createElement('div');
+          row.className = 'p-3.5 rounded-xl bg-slate-950 border border-slate-800 flex flex-col sm:flex-row items-start sm:items-center gap-3';
+
+          const themeOptions = Object.values(COLOR_THEMES).map((th) =>
+            `<option value="${th.key}" ${item.themeKey === th.key ? 'selected' : ''}>${escapeHtml(th.name)}</option>`
+          ).join('');
+
+          row.innerHTML = `
+            <div class="flex items-center gap-2">
+              <input data-field="emoji" data-idx="${idx}" type="text" value="${escapeHtml(item.emoji)}" maxlength="4" class="w-14 h-11 text-center text-2xl bg-slate-900 border border-slate-700 rounded-xl focus:outline-none focus:border-indigo-500" />
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 flex-1 w-full">
+              <div>
+                <span class="text-[10px] text-slate-400 block mb-0.5">ボタン名 (受講生スマホ表示)</span>
+                <input data-field="shortLabel" data-idx="${idx}" type="text" value="${escapeHtml(item.shortLabel)}" class="w-full px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-xs font-bold text-white focus:outline-none focus:border-indigo-500" />
+              </div>
+              <div>
+                <span class="text-[10px] text-slate-400 block mb-0.5">詳細ラベル (講師画面表示)</span>
+                <input data-field="label" data-idx="${idx}" type="text" value="${escapeHtml(item.label)}" class="w-full px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-xs text-slate-200 focus:outline-none focus:border-indigo-500" />
+              </div>
+            </div>
+            <div class="flex items-center gap-2 w-full sm:w-auto justify-between sm:justify-end">
+              <div>
+                <span class="text-[10px] text-slate-400 block mb-0.5">カラー</span>
+                <select data-field="themeKey" data-idx="${idx}" class="px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-xs font-bold text-white focus:outline-none">
+                  ${themeOptions}
+                </select>
+              </div>
+              <div>
+                <span class="text-[10px] text-slate-400 block mb-0.5">集計区分</span>
+                <select data-field="sentiment" data-idx="${idx}" class="px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-xs font-bold text-white focus:outline-none">
+                  <option value="positive" ${item.sentiment !== 'negative' ? 'selected' : ''}>ポジティブ</option>
+                  <option value="negative" ${item.sentiment === 'negative' ? 'selected' : ''}>フォロー推奨</option>
+                </select>
+              </div>
+              ${state.draftReactions.length > 2 ? `
+                <button data-delete-idx="${idx}" type="button" class="mt-4 px-2.5 py-1.5 rounded-lg bg-slate-900 hover:bg-rose-950 text-slate-400 hover:text-rose-400 border border-slate-800 text-xs font-bold transition cursor-pointer" title="削除">
+                  🗑️
+                </button>
+              ` : ''}
+            </div>
+          `;
+
+          row.querySelectorAll('input, select').forEach((inp) => {
+            inp.addEventListener('input', (e) => {
+              const f = e.target.getAttribute('data-field');
+              const i = Number(e.target.getAttribute('data-idx'));
+              if (state.draftReactions[i]) {
+                state.draftReactions[i][f] = e.target.value;
+              }
+            });
+          });
+
+          const delBtn = row.querySelector('[data-delete-idx]');
+          if (delBtn) {
+            delBtn.addEventListener('click', () => {
+              if (state.draftReactions.length <= 2) return;
+              state.draftReactions.splice(idx, 1);
+              renderCustomizerRows();
+            });
+          }
+
+          container.appendChild(row);
+        });
+      }
+
+      // --------------------------------------------------
+      // 12. スマホカメラで確実に読み取れる本物のSVG QRコード生成
+      // --------------------------------------------------
+      function generateSvgQrCode(text) {
+        try {
+          if (typeof window.qrcode === 'function') {
+            const qr = window.qrcode(0, 'M');
+            qr.addData(text);
+            qr.make();
+            return qr.createSvgTag({ cellSize: 4, margin: 2, scalable: true });
+          }
+        } catch (e) {}
+        // 万一CDNがブロックされた環境用のフォールバック
+        return `<div class="p-4 text-xs text-slate-800 font-bold text-center">URLをコピーして共有してください</div>`;
+      }
+
+      function escapeHtml(str) {
+        return String(str ?? '')
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;');
+      }
+
+      // --------------------------------------------------
+      // 13. イベントリスナー登録 ＆ 初期化
+      // --------------------------------------------------
+      function initEvents() {
+        // クラウド接続ステータスバッジのクリックで再接続
+        const cloudBadge = document.getElementById('cloud-status-badge');
+        if (cloudBadge) {
+          cloudBadge.addEventListener('click', () => {
+            showToast('🌐 クラウド通信サーバーへ再接続しています...', 'emerald');
+            initCloudSync(true);
+          });
+        }
+
+        // 受講生タブ / 講師タブの切替
+        document.getElementById('tab-btn-student').addEventListener('click', () => {
+          state.viewMode = 'student';
+          renderRoleAndModeVisibility();
+          renderAll();
+        });
+
+        document.getElementById('tab-btn-instructor').addEventListener('click', () => {
+          if (state.isStudentLocked) return;
+          if (state.pinLockEnabled && !state.isInstructorUnlocked) {
+            const modalPin = document.getElementById('modal-pin-auth');
+            const errEl = document.getElementById('pin-auth-error');
+            const inp = document.getElementById('input-pin-auth');
+            if (errEl) errEl.classList.add('hidden');
+            if (inp) inp.value = '';
+            modalPin.classList.remove('hidden');
+            modalPin.classList.add('flex');
+            if (inp) inp.focus();
+            return;
+          }
+          state.viewMode = 'instructor';
+          renderRoleAndModeVisibility();
+          renderAll();
+        });
+
+        // PIN認証モーダル
+        document.getElementById('btn-close-pin-auth').addEventListener('click', () => {
+          const m = document.getElementById('modal-pin-auth');
+          m.classList.add('hidden');
+          m.classList.remove('flex');
+        });
+
+        document.getElementById('btn-Quick-fill-pin').addEventListener('click', () => {
+          const inp = document.getElementById('input-pin-auth');
+          if (inp) inp.value = state.instructorPin;
+        });
+
+        document.getElementById('form-pin-auth').addEventListener('submit', (e) => {
+          e.preventDefault();
+          const inp = document.getElementById('input-pin-auth');
+          const errEl = document.getElementById('pin-auth-error');
+          if (inp && inp.value.trim() === state.instructorPin) {
+            state.isInstructorUnlocked = true;
+            state.viewMode = 'instructor';
+            const m = document.getElementById('modal-pin-auth');
+            m.classList.add('hidden');
+            m.classList.remove('flex');
+            renderRoleAndModeVisibility();
+            renderAll();
+            showToast('🔓 講師・スクリーン画面のロックを解除しました', 'emerald');
+          } else if (errEl) {
+            errEl.classList.remove('hidden');
+          }
+        });
+
+        // 講師PIN設定モーダル
+        document.getElementById('btn-open-pin-modal').addEventListener('click', () => {
+          document.getElementById('checkbox-pin-enabled').checked = state.pinLockEnabled;
+          document.getElementById('input-new-pin').value = state.instructorPin;
+          const m = document.getElementById('modal-pin-config');
+          m.classList.remove('hidden');
+          m.classList.add('flex');
+        });
+
+        document.getElementById('btn-close-pin-config').addEventListener('click', () => {
+          const m = document.getElementById('modal-pin-config');
+          m.classList.add('hidden');
+          m.classList.remove('flex');
+        });
+
+        document.getElementById('btn-save-pin-config').addEventListener('click', () => {
+          const enabled = document.getElementById('checkbox-pin-enabled').checked;
+          const newPin = document.getElementById('input-new-pin').value.trim() || '1234';
+          state.pinLockEnabled = enabled;
+          state.instructorPin = newPin;
+          saveRoomData();
+          const m = document.getElementById('modal-pin-config');
+          m.classList.add('hidden');
+          m.classList.remove('flex');
+          renderRoleAndModeVisibility();
+          showToast('🔐 講師PIN設定を更新しました', 'emerald');
+        });
+
+        // 講義ルーム変更＆コピー
+        document.getElementById('form-room').addEventListener('submit', (e) => {
+          e.preventDefault();
+          if (state.isStudentLocked) return;
+          const val = document.getElementById('input-room').value.trim().toUpperCase();
+          if (val && val !== state.roomId) {
+            state.roomId = val;
+            loadRoomData();
+            initCloudSync(false);
+            renderStudentReactionButtons();
+            renderAll();
+            showToast(`講義ルーム「${state.roomId}」に切り替えました`, 'emerald');
+          }
+        });
+
+        document.getElementById('btn-copy-room').addEventListener('click', () => {
+          copyTextSafely(state.roomId, `講義コード「${state.roomId}」をコピーしました`);
+        });
+
+        // QR共有モーダル（?role=student 付きURL生成）
+        document.getElementById('btn-open-qr').addEventListener('click', () => {
+          let baseUrl = 'https://lecture-pulse.example.com/';
+          try {
+            if (window.location.origin && window.location.origin !== 'null') {
+              baseUrl = `${window.location.origin}${window.location.pathname}`;
+            }
+          } catch (e) {}
+          const shareUrl = `${baseUrl}?room=${encodeURIComponent(state.roomId)}&role=student`;
+          document.getElementById('qr-room-label').textContent = state.roomId;
+          document.getElementById('qr-url-input').value = shareUrl;
+          document.getElementById('qr-svg-container').innerHTML = generateSvgQrCode(shareUrl);
+
+          const m = document.getElementById('modal-qr');
+          m.classList.remove('hidden');
+          m.classList.add('flex');
+        });
+
+        document.getElementById('btn-close-qr').addEventListener('click', () => {
+          const m = document.getElementById('modal-qr');
+          m.classList.add('hidden');
+          m.classList.remove('flex');
+        });
+
+        document.getElementById('btn-copy-qr-url').addEventListener('click', () => {
+          const url = document.getElementById('qr-url-input').value;
+          copyTextSafely(url, '受講生専用URLをコピーしました！');
+        });
+
+        // QR読取時の受講生専用ロック画面をシミュレート体験
+        document.getElementById('btn-simulate-qr-student').addEventListener('click', () => {
+          const m = document.getElementById('modal-qr');
+          m.classList.add('hidden');
+          m.classList.remove('flex');
+          state.isStudentLocked = true;
+          state.viewMode = 'student';
+          renderRoleAndModeVisibility();
+          renderAll();
+          showToast('🔒 QR読取時の「受講生専用ロック画面」に切り替えました', 'emerald');
+        });
+
+        document.getElementById('btn-exit-student-lock').addEventListener('click', () => {
+          state.isStudentLocked = false;
+          state.isInstructorUnlocked = true;
+          state.viewMode = 'instructor';
+          renderRoleAndModeVisibility();
+          renderAll();
+          showToast('🔓 講師・スクリーン画面へ戻りました', 'emerald');
+        });
+
+        // 講師画面：デモモード切替・速度変更・90分サンプルデータ生成
+        document.getElementById('btn-sim-toggle').addEventListener('click', () => {
+          state.simActive = !state.simActive;
+          updateSimulatorTimer();
+        });
+
+        document.getElementById('select-sim-speed').addEventListener('change', (e) => {
+          state.simSpeed = e.target.value;
+          if (state.simActive) updateSimulatorTimer();
+        });
+
+        document.getElementById('btn-generate-90m').addEventListener('click', generate90MinLectureSample);
+
+        // 講師画面：時間集計単位ボタン（30分 / 1時間 / 1時間半 / 5分 / 1分 / 10秒）
+        document.querySelectorAll('.bucket-btn').forEach((btn) => {
+          btn.addEventListener('click', (e) => {
+            const sec = Number(e.currentTarget.getAttribute('data-bucket'));
+            state.bucketSizeSec = sec;
+            // 30分以上の集計単位を選んだとき、表示枠が短すぎれば自動的に広げる
+            if (sec >= 1800 && state.timeWindowMin < 90) {
+              state.timeWindowMin = 180;
+            } else if (sec === 10 && state.timeWindowMin > 30) {
+              state.timeWindowMin = 5;
+            }
+            updateBucketAndWindowButtonStyles();
+            renderAll();
+          });
+        });
+
+        // 講師画面：全体表示枠ボタン
+        document.querySelectorAll('.window-btn').forEach((btn) => {
+          btn.addEventListener('click', (e) => {
+            state.timeWindowMin = Number(e.currentTarget.getAttribute('data-window'));
+            updateBucketAndWindowButtonStyles();
+            renderAll();
+          });
+        });
+
+        // グラフ種類切替
+        document.getElementById('chart-type-bar').addEventListener('click', () => {
+          state.chartType = 'bar';
+          document.getElementById('chart-type-bar').className = 'px-2.5 py-1 rounded-lg text-xs font-bold transition bg-emerald-600 text-white cursor-pointer';
+          document.getElementById('chart-type-line').className = 'px-2.5 py-1 rounded-lg text-xs font-bold transition text-slate-400 hover:text-white cursor-pointer';
+          renderAll();
+        });
+
+        document.getElementById('chart-type-line').addEventListener('click', () => {
+          state.chartType = 'line';
+          document.getElementById('chart-type-line').className = 'px-2.5 py-1 rounded-lg text-xs font-bold transition bg-emerald-600 text-white cursor-pointer';
+          document.getElementById('chart-type-bar').className = 'px-2.5 py-1 rounded-lg text-xs font-bold transition text-slate-400 hover:text-white cursor-pointer';
+          renderAll();
+        });
+
+        // リアクション編集モーダル操作
+        document.getElementById('btn-open-customizer').addEventListener('click', openReactionCustomizerModal);
+        const closeCustomizer = () => {
+          const m = document.getElementById('modal-customizer');
+          m.classList.add('hidden');
+          m.classList.remove('flex');
+        };
+        document.getElementById('btn-close-customizer').addEventListener('click', closeCustomizer);
+        document.getElementById('btn-cancel-customizer').addEventListener('click', closeCustomizer);
+
+        document.getElementById('btn-add-reaction-row').addEventListener('click', () => {
+          if (state.draftReactions.length >= 8) return;
+          const themeKeys = Object.keys(COLOR_THEMES);
+          const emojis = ['👏', '🎉', '💡', '🤔', '💤', '⏩', '🐢', '❤️'];
+          state.draftReactions.push({
+            id: 'custom_' + Date.now().toString(36),
+            shortLabel: 'リアクション',
+            label: 'カスタム反応',
+            emoji: emojis[state.draftReactions.length % emojis.length],
+            themeKey: themeKeys[state.draftReactions.length % themeKeys.length],
+            sentiment: 'positive',
+            points: 10
+          });
+          renderCustomizerRows();
+        });
+
+        document.getElementById('btn-reset-default-reactions').addEventListener('click', () => {
+          state.draftReactions = cloneDeep(DEFAULT_REACTIONS);
+          renderCustomizerRows();
+        });
+
+        document.getElementById('btn-save-customizer').addEventListener('click', () => {
+          state.reactionList = state.draftReactions.map((r, i) => ({
+            id: r.id || `react_${i}`,
+            shortLabel: (r.shortLabel || '反応').trim(),
+            label: (r.label || r.shortLabel || '反応').trim(),
+            emoji: (r.emoji || '👍').trim(),
+            themeKey: COLOR_THEMES[r.themeKey] ? r.themeKey : 'emerald',
+            sentiment: r.sentiment === 'negative' ? 'negative' : 'positive',
+            points: Number(r.points) || 10
+          }));
+          saveRoomData();
+          publishSyncMessage({
+            kind: 'CONFIG_UPDATED',
+            roomId: state.roomId,
+            reactionList: state.reactionList
+          });
+          closeCustomizer();
+          renderStudentReactionButtons();
+          renderAll();
+          showToast('⚙️ リアクション設定を保存し、受講生のスマホとグラフに反映しました！', 'emerald');
+        });
+
+        // CSVエクスポート
+        document.getElementById('btn-export-csv').addEventListener('click', () => {
+          const stats = computeStatsAndBuckets();
+          const headers = ['時間帯', ...state.reactionList.map((r) => `${r.emoji}${r.shortLabel}`), '合計'];
+          const rows = stats.buckets.map((b) => [
+            b.label,
+            ...state.reactionList.map((r) => b[r.id] || 0),
+            b.total
+          ]);
+          const csv = '\uFEFF' + [headers.join(','), ...rows.map((r) => r.join(','))].join('\n');
+          const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `lecture_pulse_${state.roomId}.csv`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          showToast('📥 CSVファイルをダウンロードしました', 'emerald');
+        });
+
+        // リセットモーダル
+        document.getElementById('btn-open-reset').addEventListener('click', () => {
+          document.getElementById('reset-room-name').textContent = state.roomId;
+          const m = document.getElementById('modal-reset');
+          m.classList.remove('hidden');
+          m.classList.add('flex');
+        });
+
+        document.getElementById('btn-cancel-reset').addEventListener('click', () => {
+          const m = document.getElementById('modal-reset');
+          m.classList.add('hidden');
+          m.classList.remove('flex');
+        });
+
+        document.getElementById('btn-confirm-reset').addEventListener('click', () => {
+          state.events = [];
+          state.seenEventIds.clear();
+          state.personalScore = 0;
+          state.combo = 0;
+          saveRoomData();
+          publishSyncMessage({ kind: 'RESET_ROOM', roomId: state.roomId });
+          const m = document.getElementById('modal-reset');
+          m.classList.add('hidden');
+          m.classList.remove('flex');
+          renderAll();
+          showToast('🗑️ 講義ルームの記録をリセットしました', 'amber');
+        });
+
+        // キャンバスのマウスホバー・ツールチップ表示
+        const canvas = document.getElementById('reaction-chart-canvas');
+        const tooltip = document.getElementById('chart-tooltip');
+        if (canvas && tooltip) {
+          canvas.addEventListener('mousemove', (e) => {
+            const rect = canvas.getBoundingClientRect();
+            const mx = e.clientX - rect.left;
+            const my = e.clientY - rect.top;
+            const hit = state.chartBuckets.find((b) => Math.abs(mx - (b._xCenter || 0)) <= (b._colWidth || 30) / 2);
+            if (!hit) {
+              tooltip.classList.add('hidden');
+              return;
+            }
+            tooltip.classList.remove('hidden');
+            tooltip.innerHTML = `
+              <div class="font-bold text-white border-b border-slate-700 pb-1 mb-1.5">${escapeHtml(hit.label)}</div>
+              ${state.reactionList.map((r) => `
+                <div class="flex items-center justify-between gap-3 py-0.5">
+                  <span class="text-slate-300">${escapeHtml(r.emoji)} ${escapeHtml(r.shortLabel)}</span>
+                  <span class="font-mono font-bold text-white">${hit[r.id] || 0}</span>
+                </div>
+              `).join('')}
+              <div class="flex items-center justify-between gap-3 pt-1 mt-1 border-t border-slate-800 text-emerald-400 font-bold">
+                <span>合計</span>
+                <span class="font-mono">${hit.total} 件</span>
+              </div>
+            `;
+            const leftPos = Math.min(rect.width - 175, Math.max(10, mx + 12));
+            tooltip.style.left = `${leftPos}px`;
+            tooltip.style.top = `${Math.max(10, my - 20)}px`;
+          });
+          canvas.addEventListener('mouseleave', () => {
+            tooltip.classList.add('hidden');
+          });
+        }
+
+        window.addEventListener('resize', () => {
+          if (state.viewMode === 'instructor') {
+            const stats = computeStatsAndBuckets();
+            drawReactionChart(stats.buckets);
+          }
+        });
+      }
+
+      function updateBucketAndWindowButtonStyles() {
+        document.querySelectorAll('.bucket-btn').forEach((btn) => {
+          const val = Number(btn.getAttribute('data-bucket'));
+          btn.className = val === state.bucketSizeSec
+            ? 'bucket-btn px-2.5 py-1 rounded-lg text-xs font-bold transition bg-indigo-600 text-white cursor-pointer'
+            : 'bucket-btn px-2.5 py-1 rounded-lg text-xs font-bold transition text-slate-400 hover:text-white cursor-pointer';
+        });
+        document.querySelectorAll('.window-btn').forEach((btn) => {
+          const val = Number(btn.getAttribute('data-window'));
+          btn.className = val === state.timeWindowMin
+            ? 'window-btn px-2.5 py-1 rounded-lg text-xs font-bold transition bg-amber-500 text-slate-950 cursor-pointer'
+            : 'window-btn px-2.5 py-1 rounded-lg text-xs font-bold transition text-slate-400 hover:text-white cursor-pointer';
+        });
+      }
+
+      // 起動処理
+      loadRoomData();
+      initEvents();
+      updateBucketAndWindowButtonStyles();
+      renderRoleAndModeVisibility();
+      renderStudentReactionButtons();
+      renderAll();
+      initCloudSync(false);
+
+      // 1秒ごとの定期リフレッシュ（エネルギーゲージ回復＆リアルタイムグラフ進行）
+      setInterval(() => {
+        updateEnergyBars();
+        renderAll();
+      }, 1000);
+
+    })();
+  </script>
+</body>
+</html>
